@@ -102,6 +102,15 @@ export interface LoopToolResult {
 	summary?: string;
 	/** 失败原因（status=failed 时给可操作信息，如 pi-subagents 安装引导；中止记 "aborted"） */
 	error?: string;
+	/** 评估结论摘要（M4-T2：迭代闭环最终轮 evaluation 的结果侧投影） */
+	evaluation?: {
+		/** 最终轮结论（verified 首见即终；budget_exhausted/failed 为终止轮的末次评估） */
+		verdict: Evaluation["verdict"];
+		/** 最终轮评分（clamp 0-100 整数） */
+		score: number;
+		/** 终止（通过或预算尽/中止）时所在的迭代轮（0 起计，0=首轮） */
+		round: number;
+	};
 }
 
 /** Run 的只读摘要（/loop-status 列表与调度内核使用） */
@@ -188,6 +197,8 @@ export interface IterationEntry {
 	endedAt?: string;
 	/** 失败原因（status=failed 时） */
 	error?: string;
+	/** 所属迭代轮（M4-T2：0 起计——0=首轮；多轮执行的 entry 分轮归组，读取侧按 round 分组展示。orchestrator 落盘时不感知轮次，由迭代引擎补标） */
+	round?: number;
 }
 
 /* ================================================================

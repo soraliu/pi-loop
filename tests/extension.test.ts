@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import type { PlanUpdate, RunOutcome } from "../src/core/orchestrator.ts";
+import type { RoundEvent } from "../src/core/iterate.ts";
 import type { SubagentEventBus } from "../src/core/rpc.ts";
 import type {
   CommandContext,
@@ -179,10 +180,26 @@ interface HostUpdate {
   content: Array<{ type: string; text: string }>;
 }
 
+/** critic 完成回复的缺省形态：verified 围栏（迭代闭环的正常通关机器） */
+function fencedEvaluationResult(evaluation: Record<string, unknown>): string {
+  return `评审小结：过程略。\n\`\`\`json\n${JSON.stringify(evaluation)}\n\`\`\`\n`;
+}
+
+/** 缺省 critic 评估结论（verified——单轮通关的既有用例语义保持） */
+const DEFAULT_CRITIC_REPLY = fencedEvaluationResult({
+  verdict: "verified",
+  score: 92,
+  reasons: ["覆盖全部验收标准"],
+  blame: [],
+});
+
 /**
- * 自动应答的 fake 事件总线（M2-T4：经 fake pi 的 events 注入，工具/命令层两用）。
+ * 自动应答的 fake 事件总线（M2-T4：经 fake pi 的 events 注入，工具/命令层两用；
+ * M4-T2：critic spawn 分诊 + 任务文本台账）。
  * 时序与真实总线同构的最小仿真：spawn 请求 → 微任务内回受理 reply（含 runId）
  * → 宏任务定时器投递 async-complete（此时 waitForCompletion 必已订阅）。
+ * 任务文本分诊（M4-T2 迭代闭环的评估输入）：designer 契约行 / critic 评审提示词 /
+ * 其余=计划步骤；critic spawn 的完成回复带围栏评估结论（criticReply 可脚本化轮次）。
  * mode="silent"：收到请求不应答（pi-subagents 缺席——只能靠客户端超时兜底）。
  */
 function makeFakeSubagentsBus(
@@ -191,15 +208,19 @@ function makeFakeSubagentsBus(
     /** 完成事件投递前按 spawn 的任务文本同步回调（M3-T5：designer 成功通道——模拟
      * designer agent 先写 designer-plan.json 再完成，与真实时序同构） */
     preComplete?: (task: string) => void;
+    /** critic 完成回复脚本（缺省 verified 围栏；函数形按 critic 调用序取 0 起计的轮次） */
+    criticReply?: string | ((criticCallIndex: number) => string);
   } = {},
-): SubagentEventBus {
+): SubagentEventBus & { spawnedTasks: string[] } {
   const listeners = new Map<string, Set<(payload: unknown) => unknown>>();
+  const spawnedTasks: string[] = [];
   let counter = 0;
+  let criticCalls = 0;
   const deliver = (event: string, payload: unknown): void => {
     for (const handler of [...(listeners.get(event) ?? [])]) handler(payload);
   };
-  return {
-    emit: (event: string, payload?: unknown) => {
+  const bus: SubagentEventBus & { spawnedTasks: string[] } = {
+    emit: (event, payload?: unknown) => {
       if (event !== "subagents:rpc:v1:request" || opts.mode === "silent") {
         return undefined;
       }
@@ -207,6 +228,8 @@ function makeFakeSubagentsBus(
         requestId: string;
         params?: { task?: string };
       };
+      const task = req.params?.task ?? "";
+      spawnedTasks.push(task);
       const runId = `fake-run-${++counter}`;
       // 受理应答：微任务（in-process 即时应答）
       queueMicrotask(() =>
@@ -219,7 +242,20 @@ function makeFakeSubagentsBus(
       // 完成事件：延迟宏任务（晚于 waitForCompletion 的订阅）
       setTimeout(() => {
         // preComplete 先于完成事件同步执行——产物文件对 extractPlan 先可见
-        opts.preComplete?.(req.params?.task ?? "");
+        opts.preComplete?.(task);
+        if (task.includes("研究任务评审员")) {
+          // critic 完成：围栏评估结论（迭代闭环的评估输入）
+          const reply =
+            typeof opts.criticReply === "function"
+              ? opts.criticReply(criticCalls++)
+              : (opts.criticReply ?? DEFAULT_CRITIC_REPLY);
+          deliver("subagent:async-complete", {
+            runId,
+            status: "succeeded",
+            output: reply,
+          });
+          return;
+        }
         deliver("subagent:async-complete", {
           runId,
           status: "succeeded",
@@ -240,7 +276,9 @@ function makeFakeSubagentsBus(
         set.delete(handler);
       };
     },
+    spawnedTasks,
   };
+  return bus;
 }
 
 // ---------- 工具：loop_task ----------
@@ -566,14 +604,22 @@ describe("/loop-status、/loop-cases、/loop-methods", () => {
 
 // ---------- M2-T4：runLoopTask 真实调度（双行为对照） ----------
 describe("runLoopTask 真实路径", () => {
-  it("fake 总线完成研究：completed、遥测/迭代数落真值、run.json 终态一致", async () => {
+  it("fake 总线完成研究：completed、遥测/迭代数落真值、run.json 终态一致（critic verified 一轮通关）", async () => {
     const tmp = makeTempDir();
     const saved = setLoopEnv(tmp, "real");
     try {
-      const updates: PlanUpdate[] = [];
+      // M4-T2：onUpdate 联合事件分采（步骤事件 + 轮次事件）
+      const stepUpdates: PlanUpdate[] = [];
+      const roundEvents: RoundEvent[] = [];
       const result = await runLoopTask(
         { task: "研究 tokio 调度器内幕" },
-        { busEnv: makeFakeSubagentsBus(), onUpdate: (u) => updates.push(u) },
+        {
+          busEnv: makeFakeSubagentsBus(),
+          onUpdate: (u) => {
+            if ("kind" in u) roundEvents.push(u);
+            else stepUpdates.push(u);
+          },
+        },
       );
       // LoopToolResult 真值（status / 遥测 / 迭代数 / preset 快照 / runId）
       expect(result.status).toBe("completed");
@@ -592,22 +638,33 @@ describe("runLoopTask 真实路径", () => {
       });
       expect(result.error).toBeUndefined();
       expect(result.summary).toContain("1/1");
-      // onUpdate 管线：受理 running → 完成 succeeded（完成摘要透传）
-      expect(updates.map((u) => `${u.stepId}:${u.status}`)).toEqual([
+      // M4-T2：evaluation 摘要（verdict/score/round——首轮通关）
+      expect(result.evaluation).toEqual({
+        verdict: "verified",
+        score: 92,
+        round: 0,
+      });
+      // onUpdate 管线：步骰受理 running → 完成 succeeded（完成摘要透传）
+      expect(stepUpdates.map((u) => `${u.stepId}:${u.status}`)).toEqual([
         "research:running",
         "research:succeeded",
       ]);
-      expect(updates[1]?.summary).toContain("tokio");
+      expect(stepUpdates[1]?.summary).toContain("tokio");
+      // 轮次事件：start → end(done)（一轮通关无 retry）
+      expect(roundEvents.map((e) => `${e.phase}:${String(e.next)}`)).toEqual([
+        "start:undefined",
+        "end:done",
+      ]);
       // M3-T4 接线：通用 fake 应答无产物文件/围栏 → designer 3 次校验尝试耗尽后降级
-      // builtin 照跑（M2 等价链路）；LoopToolResult.plan 如实带 origin/steps/degraded
-      // （降级禁止冒充正常生成）
+      // builtin 照跑（M2 等价链路，M4-T2 起进迭代循环）；LoopToolResult.plan 如实带
+      // origin/steps/degraded（降级禁止冒充正常生成）
       expect(result.plan).toEqual({
         origin: "builtin",
         steps: 1,
         degraded: true,
       });
       // run.json 终态（与列表视图一致；plan 全量元信息入档——origin/steps/notes/
-      // degraded/channel/attempts）
+      // degraded/channel/attempts + M4-T2 的 round/evaluation/final）
       const record = JSON.parse(
         fs.readFileSync(
           path.join(tmp, "runs", result.runId, "run.json"),
@@ -615,6 +672,8 @@ describe("runLoopTask 真实路径", () => {
         ),
       ) as {
         status: string;
+        round?: number;
+        final?: { round: number; verdict: string; score: number };
         plan?: {
           origin: string;
           steps: number;
@@ -636,6 +695,12 @@ describe("runLoopTask 真实路径", () => {
         "designer 降级：连续 3 次尝试均未通过校验",
       );
       expect(record.status).toBe("completed");
+      expect(record.round).toBe(0);
+      expect(record.final).toEqual({
+        round: 0,
+        verdict: "verified",
+        score: 92,
+      });
       expect(record.iterations).toHaveLength(1);
       expect(record.iterations[0]).toMatchObject({
         stepId: "research",
@@ -670,7 +735,7 @@ describe("runLoopTask 真实路径", () => {
     }
   });
 
-  it("总线无应答（fake 超时）→ failed + 安装引导 + run.json failed", async () => {
+  it("总线无应答（fake 超时）→ 迭代烧尽预算后 budget_exhausted + 安装引导（M4-T2：critic 通道失败也如实走完迭代预算）", async () => {
     const tmp = makeTempDir();
     const saved = setLoopEnv(tmp, "real");
     try {
@@ -681,14 +746,24 @@ describe("runLoopTask 真实路径", () => {
           rpcTimeoutMs: 25, // 缩短受理等待：快速走完超时兜底
         },
       );
-      expect(result.status).toBe("failed");
+      // medium 档（maxResultIterations=2）→ 3 轮均无评估通过 → 预算尽如实枚举
+      expect(result.status).toBe("budget_exhausted");
+      expect(result.error).toContain("budget_exhausted: 迭代轮数上限 2 轮用尽");
+      // 错误优先级：pi-subagents 缺席标记 → 安装引导与运行级文案并列（M2 语义延续）
       expect(result.error).toContain("请安装 pi-subagents");
       expect(result.error).toContain("pi install npm:pi-subagents");
+      // 遥测口径：steps/succeeded/failed 按末轮分轮切片，iterations 报累计（3 轮 × 1 步）
       expect(result.telemetry).toMatchObject({
         steps: 1,
         succeeded: 0,
         failed: 1,
-        iterations: 1,
+        iterations: 3,
+      });
+      // 评估结论摘要：末轮 critic spawn 失败的 fail 留档
+      expect(result.evaluation).toMatchObject({
+        verdict: "fail",
+        score: 0,
+        round: 2,
       });
       const record = JSON.parse(
         fs.readFileSync(
@@ -697,10 +772,17 @@ describe("runLoopTask 真实路径", () => {
         ),
       ) as {
         status: string;
-        iterations: Array<{ error?: string }>;
+        error?: string;
+        final?: { round: number; verdict: string; score: number };
+        iterations: Array<{ error?: string; round?: number }>;
       };
       expect(record.status).toBe("failed");
+      expect(record.error).toContain("budget_exhausted:");
+      // 最后 evaluation 留档（末轮 critic spawn 失败的 fail 结论不丢）
+      expect(record.final).toEqual({ round: 2, verdict: "fail", score: 0 });
       expect(record.iterations[0]?.error).toContain("请安装 pi-subagents");
+      // 3 轮各 1 步：round 标注分轮归组
+      expect(record.iterations.map((e) => e.round)).toEqual([0, 1, 2]);
     } finally {
       restoreEnv(saved);
     }
@@ -769,11 +851,15 @@ describe("loop_task 工具 — 真实调度", () => {
       // M3-T4：计划摘要进工具可见文本（designer 降级路径 → origin=builtin/degraded）
       expect(res.content[0].text).toContain('"plan"');
       expect(res.content[0].text).toContain('"builtin"');
-      // 宿主 onUpdate：两段进度（running → succeeded），文案含步骤与状态
-      expect(hostUpdates).toHaveLength(2);
-      expect(hostUpdates[0].content[0]?.text).toContain("research");
-      expect(hostUpdates[0].content[0]?.text).toContain("开始执行");
-      expect(hostUpdates[1].content[0]?.text).toContain("执行完成");
+      // 宿主 onUpdate：四段进度（轮次 start → running → succeeded → 轮次 end）
+      expect(hostUpdates).toHaveLength(4);
+      expect(hostUpdates[0].content[0]?.text).toContain("第 1 轮迭代开始");
+      expect(hostUpdates[1].content[0]?.text).toContain("research");
+      expect(hostUpdates[1].content[0]?.text).toContain("开始执行");
+      expect(hostUpdates[2].content[0]?.text).toContain("执行完成");
+      expect(hostUpdates[3].content[0]?.text).toContain(
+        "第 1 轮迭代结束：验收通过",
+      );
       // run.json 终态
       const record = JSON.parse(
         fs.readFileSync(
@@ -810,7 +896,7 @@ describe("loop_task 工具 — 真实调度", () => {
 
 // ---------- M2-T4：/loop 命令真实路径与进度节流 ----------
 describe("/loop 命令 — 真实调度与进度节流", () => {
-  it("真实路径（fake 总线经 pi.events 注入）→ 开始 + 每步终态进度 + 完成摘要", async () => {
+  it("真实路径（fake 总线经 pi.events 注入）→ 轮次首尾 + 开始 + 每步终态 + 完成摘要", async () => {
     const tmp = makeTempDir();
     const saved = setLoopEnv(tmp, "real");
     try {
@@ -818,17 +904,23 @@ describe("/loop 命令 — 真实调度与进度节流", () => {
       registerLoopCommands(pi);
       const { ctx, messages } = makeNotifyCtx();
       await commands.get("loop")!.handler("研究 X --effort low", ctx);
-      // 单步计划：1 条开始 + 1 条终态（T4-M2：终态可见性）+ 1 条完成摘要
-      expect(messages).toHaveLength(3);
+      // 单轮通关：轮次 start + 步骰开始 + 步骰终态 + 轮次 end + 完成摘要 = 5 条
+      expect(messages).toHaveLength(5);
       expect(messages[0].level).toBe("info");
-      expect(messages[0].text).toContain("research");
       expect(messages[0].text).toContain("[loop]");
-      expect(messages[0].text).toContain("开始执行");
+      expect(messages[0].text).toContain("第 1 轮迭代开始");
       expect(messages[1].level).toBe("info");
       expect(messages[1].text).toContain("research");
-      expect(messages[1].text).toContain("执行完成");
-      expect(messages[2].text).toMatch(/r-[a-z0-9-]+/);
-      expect(messages[2].text).toContain("1/1");
+      expect(messages[1].text).toContain("[loop]");
+      expect(messages[1].text).toContain("开始执行");
+      expect(messages[2].level).toBe("info");
+      expect(messages[2].text).toContain("research");
+      expect(messages[2].text).toContain("执行完成");
+      expect(messages[3].level).toBe("info");
+      expect(messages[3].text).toContain("第 1 轮迭代结束");
+      expect(messages[3].text).toContain("验收通过");
+      expect(messages[4].text).toMatch(/r-[a-z0-9-]+/);
+      expect(messages[4].text).toContain("1/1");
       const runs = listRecentRuns(tmp);
       expect(runs).toHaveLength(1);
       expect(runs[0].effort).toBe("low");
@@ -872,6 +964,38 @@ describe("/loop 命令 — 真实调度与进度节流", () => {
     expect(messages[3].text).toContain("critic");
     expect(messages[3].text).toContain("执行失败");
     expect(messages[3].level).toBe("error");
+  });
+
+  it("节流器的轮次事件（M4-T2）：每轮首尾各一条，轮边界重置节流——新一轮里同 stepId 的终态重新可见", () => {
+    const messages: Array<{ text: string; level?: string }> = [];
+    const notify = makeStepNotifier((text, level) =>
+      messages.push({ text, level }),
+    );
+    // 首轮：开始 1 条 + 步骰终态 1 条
+    notify({ stepId: "a", agent: "researcher", status: "running" });
+    notify({ stepId: "a", agent: "researcher", status: "failed" });
+    // 轮终了（未通过 → warning）+ 新一轮开始（重置节流状态）
+    notify({
+      kind: "round",
+      round: 0,
+      phase: "end",
+      verdict: "fail",
+      score: 10,
+      next: "retry",
+    });
+    notify({ kind: "round", round: 1, phase: "start" });
+    // 新一轮里同 stepId 的同名终态不能再被去重吞掉（多轮重跑不吞进度）
+    notify({ stepId: "a", agent: "researcher", status: "failed" });
+    expect(messages).toHaveLength(5);
+    expect(messages[0].text).toContain("开始执行");
+    expect(messages[1].text).toContain("执行失败");
+    expect(messages[2].text).toContain("第 1 轮迭代结束");
+    expect(messages[2].text).toContain("注入归因重跑");
+    expect(messages[2].level).toBe("warning");
+    expect(messages[3].text).toContain("第 2 轮迭代开始");
+    expect(messages[3].level).toBe("info");
+    expect(messages[4].text).toContain("执行失败");
+    expect(messages[4].level).toBe("error");
   });
 });
 
@@ -1052,14 +1176,171 @@ describe("runLoopTask — 预算拒绝的枚举映射（M4-T0，终审 M-3 债�
       expect(result.status).toBe("budget_exhausted");
       expect(result.error).toBe("budget_exhausted: plan steps 3 > max 2");
       expect(result.summary).toContain("预算耗尽");
-      // 遥测按 outcome 落真值（3 步计划、零执行、零迭代）
+      // M4-T2：拒绝轮的合成 fail 结论也走 evaluation 摘要（verdict 如实 + 轮次 0）
+      expect(result.evaluation).toEqual({
+        verdict: "fail",
+        score: 0,
+        round: 0,
+      });
+      // 遥测按 outcome 落真值（3 步计划、零执行、零迭代；durationMs 现为闭环
+      // 总墙钟——不再倒传 executePlan 的注入值）
       expect(result.telemetry).toEqual({
         steps: 3,
         succeeded: 0,
         failed: 0,
         iterations: 0,
-        durationMs: 4,
+        durationMs: expect.any(Number),
       });
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+});
+
+// ---------- M4-T2：迭代闭环接线（verifyCommand 机器循环 + critic 归因注入循环） ----------
+describe("runLoopTask — 迭代闭环接线（M4-T2）", () => {
+  it("verifyCommand 闭环境：首次验收 fail → 原样重跑 → 次轮 verified（零 critic spawn + 分轮归组 + final 留档）", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      // 状态文件计数器（verifyCommand 的 cwd=dataDir，跨轮状态经盘上文件传递）：
+      // 第 1 次执行 exit 1（评估 fail），第 2 次 exit 0（verified）——真实 execFile 通道
+      const verify =
+        "node -e \"const fs=require('node:fs');const p='attempts.txt';const n=(fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0)+1;fs.writeFileSync(p,String(n));if(n<2){console.error('not yet');process.exit(1)}\"";
+      const bus = makeFakeSubagentsBus();
+      const result = await runLoopTask(
+        { task: "迭代闭环验证任务", verifyCommand: verify },
+        { busEnv: bus },
+      );
+      expect(result.status).toBe("completed");
+      expect(result.evaluation).toEqual({
+        verdict: "verified",
+        score: 100,
+        round: 1,
+      });
+      expect(result.summary).toContain("第 2 轮");
+      // 互斥锁定（迭代循环内同样成立）：verifyCommand 在场零 critic spawn
+      expect(bus.spawnedTasks.some((t) => t.includes("研究任务评审员"))).toBe(
+        false,
+      );
+      // 跨轮状态痕迹：第 2 次执行 verdict 翻转为 verified 的验证依据
+      expect(fs.readFileSync(path.join(tmp, "attempts.txt"), "utf-8")).toBe(
+        "2",
+      );
+      const record = JSON.parse(
+        fs.readFileSync(
+          path.join(tmp, "runs", result.runId, "run.json"),
+          "utf-8",
+        ),
+      ) as {
+        status: string;
+        round: number;
+        final?: { round: number; verdict: string; score: number };
+        iterations: Array<{ round?: number; stepId: string }>;
+      };
+      expect(record.status).toBe("completed");
+      expect(record.round).toBe(1);
+      expect(record.final).toEqual({
+        round: 1,
+        verdict: "verified",
+        score: 100,
+      });
+      // builtin 单步计划 × 两轮：分轮归组 [0, 1]
+      expect(record.iterations.map((e) => e.round)).toEqual([0, 1]);
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("critic 通道：fail（blame 注入）→ 次轮 verified——spawn 任务带前缀、非 blame 原样、run.json final 落在通过轮", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      // 两步计划（preComplete 通常设计师产物——与 M3-T5 同构）+ critic 按轮次脚本
+      const designerPlan = {
+        version: 1,
+        task: "研究 scheduler 设计空间并给出结论",
+        origin: "designer" as const,
+        notes: "两步走：先摸底再综合",
+        steps: [
+          {
+            id: "survey",
+            agent: "researcher",
+            task: "摸底主流方案",
+            dependsOn: [],
+          },
+          {
+            id: "synth",
+            agent: "researcher",
+            task: "综合对比结论",
+            dependsOn: ["survey"],
+          },
+        ],
+      };
+      let criticCalls = 0;
+      const bus = makeFakeSubagentsBus({
+        preComplete: (task) => {
+          const match = /把最终 ResearchPlan 的完整 JSON 写入文件：(\S+)/.exec(
+            task,
+          );
+          if (!match) return;
+          fs.mkdirSync(path.dirname(match[1]), { recursive: true });
+          fs.writeFileSync(match[1], JSON.stringify(designerPlan));
+        },
+        criticReply: () => {
+          criticCalls++;
+          return criticCalls === 1
+            ? fencedEvaluationResult({
+                verdict: "fail",
+                score: 10,
+                reasons: ["引用不足"],
+                blame: ["survey"],
+              })
+            : fencedEvaluationResult({
+                verdict: "verified",
+                score: 88,
+                reasons: ["补齐后达标"],
+                blame: [],
+              });
+        },
+      });
+      const result = await runLoopTask(
+        { task: "研究 scheduler 设计空间并给出结论" },
+        { busEnv: bus },
+      );
+      expect(result.status).toBe("completed");
+      expect(result.evaluation).toEqual({
+        verdict: "verified",
+        score: 88,
+        round: 1,
+      });
+      // 注入面（最小）：二轮 survey 的 spawn 任务 = 失败上下文前缀 + 原 task；
+      // 非 blame 的 synth 两轮任务原文一致
+      expect(
+        bus.spawnedTasks.includes(
+          "前一轮失败：引用不足。请修正此步骤避免同类问题：摸底主流方案",
+        ),
+      ).toBe(true);
+      expect(bus.spawnedTasks.includes("综合对比结论")).toBe(true);
+      const record = JSON.parse(
+        fs.readFileSync(
+          path.join(tmp, "runs", result.runId, "run.json"),
+          "utf-8",
+        ),
+      ) as {
+        status: string;
+        round: number;
+        final?: { round: number; verdict: string; score: number };
+        iterations: Array<{ round?: number }>;
+      };
+      expect(record.status).toBe("completed");
+      expect(record.round).toBe(1);
+      expect(record.final).toEqual({
+        round: 1,
+        verdict: "verified",
+        score: 88,
+      });
+      expect(record.iterations.map((e) => e.round)).toEqual([0, 0, 1, 1]);
     } finally {
       restoreEnv(saved);
     }

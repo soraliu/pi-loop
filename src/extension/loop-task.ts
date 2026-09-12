@@ -1,22 +1,26 @@
 // loop_task 的执行核心（M1-T4 stub → M2-T4 真实调度内核接入 → M3-T4 designer 接线
-// → M4-T0 债务收口：run.json 悬留兜底 + budget_exhausted 枚举映射）
+// → M4-T0 债务收口 → M4-T2 迭代闭环接线）
 // 工具（loop_task）与命令（/loop）共享同一入口——单一事实源，保证两边行为一致。
 // 双行为分派：PI_LOOP_STUB=1 保留 M1 stub 语义（冒烟/降级/回归）；缺省走真实调度——
-// 三步链（配置快照 → 建工作区 → 落 run.json）之后构造 SubagentsRpcClient，先经
-// generatePlan 动态生成研究计划（researcher 兼任 designer；降级=内置计划照跑，
-// M2 的 BUILTIN_PLAN 直执行路径是降级链的末端特例），DesignerOutcome 全量映射落入
-// RunRecord.plan，再经 executePlan 按预设预算（maxPlanSteps/maxParallelSubagents）
-// 逐步 spawn。runLoopTaskStub 仍是 stub 分支的实现体（M1 直呼它的既有用例原样有效）。
+// 三步链（配置快照 → 建工作区 → 落 run.json）之后构造 SubagentsRpcClient，交
+// runWithIterations 迭代闭环（designer 降级 builtin 照常进循环；execute → evaluate
+// → fail/partial 注入归因重跑 → verified 或预算尽 budget_exhausted 如实收尾），
+// DesignerOutcome 全量映射经 adapter 落 RunRecord.plan（首轮与重设计各一次）。
+// LoopToolResult 三态收口：completed（verified）/ budget_exhausted / failed +
+// evaluation 摘要字段。runLoopTaskStub 仍是 stub 分支的实现体（M1 直呼它的既有用例
+// 原样有效）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
 import {
-  executePlan,
-  type PlanUpdate,
-  type RunOutcome,
-} from "../core/orchestrator.ts";
-import { generatePlan, type DesignerOutcome } from "../core/designer.ts";
+  runWithIterations,
+  type IterateUpdate,
+  type IterationResult,
+  type RoundEvent,
+} from "../core/iterate.ts";
+import type { PlanUpdate } from "../core/orchestrator.ts";
+import type { DesignerOutcome } from "../core/designer.ts";
 import { SubagentsRpcClient, type SubagentEventBus } from "../core/rpc.ts";
 import {
   DEFAULT_EFFORT_LEVEL,
@@ -117,9 +121,9 @@ export interface RunLoopTaskOptions {
    * （与 pi-subagents 未安装同一语义）。
    */
   busEnv?: SubagentEventBus;
-  /** 进度回调（原样透传给 executePlan 的 onUpdate） */
-  onUpdate?: (update: PlanUpdate) => void;
-  /** 中止信号（原样透传给 executePlan 的 signal） */
+  /** 进度回调（轮次事件 + 步骤事件——原样透传给 runWithIterations 的 onUpdate） */
+  onUpdate?: (update: IterateUpdate) => void;
+  /** 中止信号（原样透传给 runWithIterations 的 signal） */
   signal?: AbortSignal;
   /** spawn 受理等待上限毫秒（缺省 10s；测试注入缩短以快速走完缺席分支） */
   rpcTimeoutMs?: number;
@@ -204,50 +208,72 @@ function markRunFailedInRunJson(
   }
 }
 
-/** 真实路径的 LoopToolResult 构造：遥测/迭代数按 RunOutcome 落真值，失败附可读原因 */
-function buildRealResult(
+/**
+ * 迭代闭环结果的 LoopToolResult 构造（M4-T2 三态收口）：verified→completed；
+ * budget_exhausted/failed 如实；evaluation 摘要（verdict+score+轮数）。遥测口径：
+ * succeeded/failed 按末轮分轮切片（entries 的 round 标注）报真值，iterations 报
+ * 累计（RunTelemetry 的「run.json iterations 数组长度」口径），durationMs 报闭环
+ * 总墙钟（含 designer/评估等待）。错误优先级沿用 M2 语义：pi-subagents 缺席标记
+ * → 安装引导与运行级文案并列；否则运行级镜像（迭代预算文案 / aborted / 预算拒绝原文）
+ */
+function buildIteratedResult(
   prep: PreparedRun,
-  outcome: RunOutcome,
-  planSummary?: LoopPlanBrief,
+  iteration: IterationResult,
+  wallMs: number,
 ): LoopToolResult {
-  const completed = outcome.failed === 0 && outcome.succeeded === outcome.steps;
-  // 预算拒绝映射（M4-T0，终审 M-3 债）：outcome.error 带 "budget_exhausted:" 前缀
-  // （executePlan 预算拒绝路径的返回形——零 spawn、零 entry）→ status 如实取
-  // budget_exhausted 而非裸 failed（SPEC §7.3：超界立即收尾并如实报告）
-  const budgetExhausted =
-    outcome.error !== undefined &&
-    outcome.error.startsWith("budget_exhausted:");
-  const failures = outcome.iterations
-    .filter((entry) => entry.status === "failed")
-    .map((entry) => entry.error)
-    .filter((message): message is string => message !== undefined);
-  // 错误优先级：pi-subagents 缺席标记（spawn 超时类 step 错误）→ 首个 step 级失败原因 →
-  // run 级镜像（预算拒绝的 "budget_exhausted: …" 文案透传 / 中止的 "aborted"——M3-T4）
-  const error = failures.some((message) => message.includes(RPC_ABSENT_MARK))
-    ? RPC_INSTALL_GUIDANCE
-    : (failures[0] ?? outcome.error);
+  const { outcome, finalRound, evaluation, runOutcome } = iteration;
+  const ordinal = finalRound + 1;
+  // 末轮分轮切片——多轮重跑不把历史轮的成功/失败混入末轮计数
+  const lastEntries = runOutcome.iterations.filter(
+    (entry) => entry.round === finalRound,
+  );
+  const succeeded = lastEntries.filter((e) => e.status === "succeeded").length;
+  const failed = lastEntries.filter((e) => e.status === "failed").length;
+  // 执行层预算拒绝（计划级——零步骤执行）：M4-T0 的旧文案语义保持（枚举值经
+  // outcome="budget_exhausted" 延续，语义扩展为迭代预算尽）
+  const planRejected =
+    runOutcome.error !== undefined &&
+    runOutcome.error.startsWith("budget_exhausted:") &&
+    runOutcome.iterations.length === 0;
+  const completed = outcome === "verified";
+  const budget = outcome === "budget_exhausted";
+  // 诚实措辞：结论（verdict/score/轮数）+ 末轮执行事实，不用模糊话术遮盖
+  const summary = completed
+    ? `任务完成：第 ${ordinal} 轮验收通过（verdict=verified，score=${evaluation.score}；末轮 ${succeeded}/${runOutcome.steps} 步成功，累计调度 ${runOutcome.iterations.length} 次）`
+    : planRejected
+      ? `任务因预算耗尽终止：计划 ${runOutcome.steps} 步超出允许上限（详情见 run.json）`
+      : budget
+        ? `任务因迭代预算耗尽终止：${ordinal} 轮执行后仍未通过验收（最后一轮 verdict=${evaluation.verdict}，score=${evaluation.score}）`
+        : `任务中止：第 ${ordinal} 轮后运行信号中止（最后评估 verdict=${evaluation.verdict}）`;
+  const stepFailures = lastEntries
+    .filter((e) => e.status === "failed" && e.error !== undefined)
+    .map((e) => e.error as string);
+  let error = iteration.error;
+  if (!completed && stepFailures.some((m) => m.includes(RPC_ABSENT_MARK))) {
+    error =
+      error === undefined
+        ? RPC_INSTALL_GUIDANCE
+        : `${error}\n${RPC_INSTALL_GUIDANCE}`;
+  }
   const result: LoopToolResult = {
-    status: completed
-      ? "completed"
-      : budgetExhausted
-        ? "budget_exhausted"
-        : "failed",
+    status: completed ? "completed" : budget ? "budget_exhausted" : "failed",
     runId: prep.record.id,
     effort: prep.record.effort,
     preset: prep.preset,
     telemetry: {
-      steps: outcome.steps,
-      succeeded: outcome.succeeded,
-      failed: outcome.failed,
-      iterations: outcome.iterations.length,
-      durationMs: outcome.durationMs,
+      steps: runOutcome.steps,
+      succeeded,
+      failed,
+      iterations: runOutcome.iterations.length,
+      durationMs: wallMs,
     },
-    summary: completed
-      ? `任务完成：${outcome.succeeded}/${outcome.steps} 步成功，耗时 ${outcome.durationMs}ms`
-      : budgetExhausted
-        ? `任务因预算耗尽终止：计划 ${outcome.steps} 步超出允许上限（详情见 run.json）`
-        : `任务失败：${outcome.failed} 步未通过，耗时 ${outcome.durationMs}ms（详情见 run.json）`,
-    ...(planSummary === undefined ? {} : { plan: planSummary }),
+    plan: iteration.plan,
+    evaluation: {
+      verdict: evaluation.verdict,
+      score: evaluation.score,
+      round: finalRound,
+    },
+    summary,
   };
   if (error !== undefined) result.error = error;
   return result;
@@ -256,9 +282,10 @@ function buildRealResult(
 /**
  * loop_task 的统一执行入口（工具与命令共用；M2-T4 起缺省为真实调度）。
  * - PI_LOOP_STUB=1 → M1 stub 行为（runLoopTaskStub，断言语义不变）
- * - 缺省 → 三步链 → 构造 SubagentsRpcClient → generatePlan（designer
- *   三态：成功 / 校验重试耗尽降级 / rpc 层失败降级——均不抛出，内置计划照跑）→
- *   plan 元信息入档 → executePlan(plan, budget)
+ * - 缺省 → 三步链 → 构造 SubagentsRpcClient → runWithIterations 迭代闭环
+ *   （M4-T2：designer 降级 builtin 照常进循环；execute → evaluate → 注入归因
+ *   重跑 → verified / budget_exhausted；plan 元信息经 adapter 落盘，LoopToolParams
+ *   签名不变）
  * 调度失败收敛为 status=failed 的结果（error 携带可读原因；step 级细节落 run.json），
  * 不向宿主抛裸异常。
  * @throws TypeError 当 task 缺失或 effort 非法时（调用方负责转为 error content / notify）
@@ -272,41 +299,46 @@ export async function runLoopTask(
   const rpc = new SubagentsRpcClient(opts.busEnv ?? DEAD_BUS, {
     defaultTimeoutMs: opts.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS,
   });
-  let outcome: RunOutcome;
+  const startedMs = Date.now();
   /** 已确定的计划摘要（catch 分支的诚实补档：执行链异常时也带上已知的计划元信息） */
   let planSummary: LoopPlanBrief | undefined;
   try {
-    // ① Designer 先行：动态生成研究计划（降级由其内部完成且不抛出——再做二保险
-    // 只会掩盖真实行为；rpc 层 spawn 失败/等待超时/校验耗尽均收敛为 builtin 产物）
-    const designed = await generatePlan(params.task, prep.preset, {
+    // 迭代闭环（M4-T2）：首轮 design → 每轮 execute → evaluate → fail/partial 注入
+    // 归因重跑；run.json 的 plan 元信息经 adapter 在首轮与重设计后各落盘一次
+    // （读改写——磁盘为事实源）；重启后或连续失败到预算尽按 budget_exhausted 如实收尾
+    const iteration = await runWithIterations(params.task, prep.preset, {
       rpc,
       runId: prep.record.id,
       dataDir: prep.dataDir,
       signal: opts.signal,
-    });
-    planSummary = {
-      origin: designed.plan.origin,
-      steps: designed.plan.steps.length,
-      degraded: designed.degraded,
-    };
-    // ② 元信息落盘（generatePlan 返回即写；执行中记录的其余字段归 orchestrator 管）
-    recordPlanInRunJson(
-      prep.dataDir,
-      prep.record.id,
-      planInfoFromOutcome(designed),
-    );
-    // ③ 执行：预算从生效档位原样派生（步数硬顶 + 层内并发钳制，T3 双闸）
-    outcome = await executePlan(designed.plan, {
-      rpc,
-      runId: prep.record.id,
-      dataDir: prep.dataDir,
       onUpdate: opts.onUpdate,
-      signal: opts.signal,
-      budget: {
-        maxPlanSteps: prep.preset.maxPlanSteps,
-        maxParallelSubagents: prep.preset.maxParallelSubagents,
+      verifyCommand: params.verifyCommand,
+      adapter: {
+        onPlanDesigned: (designed) => {
+          planSummary = {
+            origin: designed.plan.origin,
+            steps: designed.plan.steps.length,
+            degraded: designed.degraded,
+          };
+          recordPlanInRunJson(
+            prep.dataDir,
+            prep.record.id,
+            planInfoFromOutcome(designed),
+          );
+        },
       },
     });
+    const result = buildIteratedResult(prep, iteration, Date.now() - startedMs);
+    // 无 entry 落痕的中止（层间检查点）在 run 级已记 error="aborted"，结果侧同步
+    // 补上（iterate 的 abort 收尾已带 error="aborted"——此处为防御性双保险，不产生分歧）
+    if (
+      result.status === "failed" &&
+      opts.signal?.aborted &&
+      result.error === undefined
+    ) {
+      result.error = "aborted";
+    }
+    return result;
   } catch (error) {
     // 基建类异常（executePlan/designer 已各自完成降级路径后仍上抛的磁盘/run.json
     // 类异常——executePlan 已把 run 标 failed 后上抛）：统一收敛为 failed 结果，
@@ -334,18 +366,6 @@ export async function runLoopTask(
     };
     return failed;
   }
-  const result = buildRealResult(prep, outcome, planSummary);
-  // 无 entry 落痕的中止（层间检查点）在 run 级已记 error="aborted"，
-  // 结果侧同步补上（有 entry 时 failures 已带出，不覆盖；outcome.error 镜像
-  // 在场时同值——此处为防御性双保险，不产生分歧）
-  if (
-    result.status === "failed" &&
-    opts.signal?.aborted &&
-    result.error === undefined
-  ) {
-    result.error = "aborted";
-  }
-  return result;
 }
 
 /** PlanUpdate → 人类可读单行（工具 onUpdate 的 content 与命令 notify 共用同款文案） */
@@ -358,4 +378,32 @@ export function describeStepUpdate(update: PlanUpdate): string {
   };
   const base = `[loop] 步骤 ${update.stepId}（${update.agent}）${labels[update.status]}`;
   return update.summary === undefined ? base : `${base}：${update.summary}`;
+}
+
+/** 轮次事件 → 人类可读单行（工具 onUpdate 的 content 与命令 notify 共用——与 describeStepUpdate 同源的文案真源；轮次序数按 round+1 人类可读显示） */
+export function describeRoundUpdate(event: RoundEvent): string {
+  const base = `[loop] 第 ${event.round + 1} 轮迭代`;
+  if (event.phase === "start") return `${base}开始`;
+  if (event.verdict === undefined) return `${base}结束`;
+  const verdictText =
+    event.verdict === "verified"
+      ? `验收通过（verdict=verified，score=${event.score ?? "?"}）`
+      : `未通过（verdict=${event.verdict}，score=${event.score ?? "?"}）`;
+  const nextText =
+    event.next === "retry"
+      ? "——注入归因重跑"
+      : event.next === "redesign"
+        ? "——重新设计计划"
+        : event.next === "budget_exhausted"
+          ? "——迭代预算已用尽"
+          : event.next === "abort"
+            ? "——运行已中止"
+            : "";
+  return `${base}结束：${verdictText}${nextText}`;
+}
+
+/** 迭代进度事件的总分发（轮次事件 + 步骤事件）——工具与命令共用的单一文案真源 */
+export function describeIterateUpdate(update: IterateUpdate): string {
+  if ("kind" in update) return describeRoundUpdate(update);
+  return describeStepUpdate(update);
 }

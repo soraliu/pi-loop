@@ -229,6 +229,32 @@ describe("evaluateResult — verifyCommand 机器断言通道（存在即唯一�
 		}
 	});
 
+	it("锚定计数的数字边界守卫与末位启发（T1 review M1 收口）：前置日期形不遮蔽末位真计数；超长编号不构成计数", async () => {
+		// 前置日期 + 末位真计数：锚定句式取最后一个可信计数（旧实现取首个会被
+		// 日期抢占给出 0 分——score 失真而 verdict 不受影响）
+		const dateShadowing = await evaluateResult(
+			{
+				...baseInput(),
+				verifyCommand: `node -e "console.log('12/03/2024 passed, 8/10 passed')"`,
+			},
+			{ rpc: new FakeRpc() },
+		);
+		expect(dateShadowing.verdict).toBe("verified");
+		expect(dateShadowing.score).toBe(80);
+
+		// 超长编号形（时间戳/ID——分母 8 位）：锚定与裸兜底的 1-4 位长度守卫均拒收
+		// → 无可信计数 → 满分 100（退出码唯一权威）
+		const longDenominator = await evaluateResult(
+			{
+				...baseInput(),
+				verifyCommand: `node -e "console.log('run ref 2/20245678 passed')"`,
+			},
+			{ rpc: new FakeRpc() },
+		);
+		expect(longDenominator.verdict).toBe("verified");
+		expect(longDenominator.score).toBe(100);
+	});
+
 	it("非 0 退出码 → fail + 退出码与 stderr 尾部入 reasons（blame 恒空——无轮次归因）", async () => {
 		const evaluation = await evaluateResult(
 			{

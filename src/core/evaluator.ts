@@ -250,18 +250,24 @@ function ratioScore(n: number, m: number): number {
  *      更长的数字更像 ID/时间戳而非计数）
  */
 function parseCountScore(stdout: string): { n: number; m: number } | undefined {
+	// 锚定句式（T1 review M1 收口）：数字边界守卫（(?<!\d)/(?!\d)）与 1-4 位长度
+	// 上限为裸兜底同款——更长的数字更像 ID/时间戳而非计数；g 标志 + matchAll 取
+	// 每句式的最后一个可信计数（末位启发：前置日期形 12/03/2024 passed 类不
+	// 遮蔽输出末尾的真计数）
 	const anchored: RegExp[] = [
-		/(\d+)\s*\/\s*(\d+)\s*(?:passed|pass|ok)\b/i,
-		/(?:passed|pass|ok)\s*[:：]?\s*(\d+)\s*\/\s*(\d+)/i,
-		/(\d+)\s+of\s+(\d+)\s+(?:passed|pass|ok)\b/i,
-		/(\d+)\s+passed\s+out\s+of\s+(\d+)/i,
+		/(?<!\d)(\d{1,4})\s*\/\s*(\d{1,4})(?!\d)\s*(?:passed|pass|ok)\b/gi,
+		/(?:passed|pass|ok)\s*[:：]?\s*(?<!\d)(\d{1,4})\s*\/\s*(\d{1,4})(?!\d)/gi,
+		/(?<!\d)(\d{1,4})\s+of\s+(\d{1,4})\s+(?:passed|pass|ok)\b/gi,
+		/(?<!\d)(\d{1,4})\s+passed\s+out\s+of\s+(\d{1,4})(?!\d)/gi,
 	];
 	for (const re of anchored) {
-		const match = re.exec(stdout);
-		if (match === null) continue;
-		const n = Number(match[1]);
-		const m = Number(match[2]);
-		if (credibleCount(n, m)) return { n, m };
+		let last: { n: number; m: number } | undefined;
+		for (const match of stdout.matchAll(re)) {
+			const n = Number(match[1]);
+			const m = Number(match[2]);
+			if (credibleCount(n, m)) last = { n, m };
+		}
+		if (last !== undefined) return last;
 	}
 	let last: { n: number; m: number } | undefined;
 	for (const match of stdout.matchAll(
