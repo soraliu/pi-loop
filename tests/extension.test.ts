@@ -7,8 +7,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { CommandContext, PiExtensionApi, ToolDefinition } from "../src/extension/api.ts";import { registerLoopTools } from "../src/extension/tools.ts";
-import { parseLoopArgs, registerLoopCommands, listRecentRuns } from "../src/extension/commands.ts";
+import type {
+  CommandContext,
+  PiExtensionApi,
+  ToolDefinition,
+} from "../src/extension/api.ts";
+import { registerLoopTools } from "../src/extension/tools.ts";
+import {
+  parseLoopArgs,
+  registerLoopCommands,
+  listRecentRuns,
+} from "../src/extension/commands.ts";
 import { resolveDataDir, runLoopTaskStub } from "../src/extension/loop-task.ts";
 
 // ---------- 临时目录纪律（登记制清理，仅清理本文件创建的目录） ----------
@@ -45,8 +54,15 @@ function makeFakePi(): {
       tools.set(def.name, def);
       return undefined;
     },
-    registerCommand: (name: string, options: { description: string; handler: CapturedCommand["handler"] }) => {
-      commands.set(name, { name, description: options.description, handler: options.handler });
+    registerCommand: (
+      name: string,
+      options: { description: string; handler: CapturedCommand["handler"] },
+    ) => {
+      commands.set(name, {
+        name,
+        description: options.description,
+        handler: options.handler,
+      });
       return undefined;
     },
   };
@@ -54,10 +70,15 @@ function makeFakePi(): {
 }
 
 /** 构造 CommandContext 的 notify 收集器 */
-function makeNotifyCtx(): { ctx: CommandContext; messages: Array<{ text: string; level?: string }> } {
+function makeNotifyCtx(): {
+  ctx: CommandContext;
+  messages: Array<{ text: string; level?: string }>;
+} {
   const messages: Array<{ text: string; level?: string }> = [];
   return {
-    ctx: { ui: { notify: (text, level) => void messages.push({ text, level }) } },
+    ctx: {
+      ui: { notify: (text, level) => void messages.push({ text, level }) },
+    },
     messages,
   };
 }
@@ -75,7 +96,13 @@ describe("loop_task 工具", () => {
     const { pi, tools } = makeFakePi();
     registerLoopTools(pi);
     const def = tools.get("loop_task")!;
-    const res = await def.execute("t1", { effort: "low" }, new AbortController().signal, () => {}, {});
+    const res = await def.execute(
+      "t1",
+      { effort: "low" },
+      new AbortController().signal,
+      () => {},
+      {},
+    );
     expect(res.content[0].type).toBe("text");
     expect(res.content[0].text).toContain("task");
   });
@@ -92,6 +119,8 @@ describe("loop_task 工具", () => {
       {},
     );
     expect(res.content[0].text).toContain("low");
+    expect(res.content[0].text).toContain("medium");
+    expect(res.content[0].text).toContain("high");
     expect(res.content[0].text).toContain("max");
     expect((res.details as { error?: string }).error).toBeDefined();
   });
@@ -119,7 +148,10 @@ describe("loop_task 工具", () => {
       // 磁盘一致性
       const runFile = path.join(tmp, "runs", details.runId, "run.json");
       expect(fs.existsSync(runFile)).toBe(true);
-      const record = JSON.parse(fs.readFileSync(runFile, "utf-8")) as { effort: string; task: string };
+      const record = JSON.parse(fs.readFileSync(runFile, "utf-8")) as {
+        effort: string;
+        task: string;
+      };
       expect(record.effort).toBe("high");
       expect(record.task).toBe("研究 rust tokio 调度器");
     } finally {
@@ -154,7 +186,9 @@ describe("runLoopTaskStub 共享核心", () => {
       const result = runLoopTaskStub({ task: "无 effort 任务" });
       expect(result.effort).toBe("medium");
       expect(result.preset.maxResultIterations).toBe(2);
-      expect(fs.existsSync(path.join(tmp, "runs", result.runId, "run.json"))).toBe(true);
+      expect(
+        fs.existsSync(path.join(tmp, "runs", result.runId, "run.json")),
+      ).toBe(true);
     } finally {
       if (prev === undefined) delete process.env.PI_LOOP_DATA_DIR;
       else process.env.PI_LOOP_DATA_DIR = prev;
@@ -164,12 +198,42 @@ describe("runLoopTaskStub 共享核心", () => {
   it("task 空白 → 抛 TypeError", () => {
     expect(() => runLoopTaskStub({ task: "   " })).toThrow(TypeError);
   });
+
+  it("settings.json 覆盖档位 → preset 快照反映覆盖值（loadLoopSettings 生效链）", () => {
+    const tmp = makeTempDir();
+    const prev = process.env.PI_LOOP_DATA_DIR;
+    process.env.PI_LOOP_DATA_DIR = tmp;
+    try {
+      // 写入覆盖 medium 档的 settings.json（应生效而非回落 DEFAULT 表）
+      fs.mkdirSync(tmp, { recursive: true });
+      fs.writeFileSync(
+        path.join(tmp, "settings.json"),
+        JSON.stringify({
+          effortPresets: { medium: { maxResultIterations: 7 } },
+        }),
+      );
+      const result = runLoopTaskStub({ task: "覆盖验证" }); // 缺省 effort=medium
+      expect(result.effort).toBe("medium");
+      // I1 核心断言：快照来自生效表而非 DEFAULT（DEFAULT.medium.maxResultIterations = 2）
+      expect(result.preset.maxResultIterations).toBe(7);
+      // 未覆盖字段保持默认深合并值
+      expect(result.preset.maxParallelSubagents).toBe(4);
+      // run.json 同盘，磁盘与返回一致
+      const record = JSON.parse(
+        fs.readFileSync(path.join(tmp, "runs", result.runId, "run.json"), "utf8"),
+      ) as { effort: string };
+      expect(record.effort).toBe("medium");
+    } finally {
+      if (prev === undefined) delete process.env.PI_LOOP_DATA_DIR;
+      else process.env.PI_LOOP_DATA_DIR = prev;
+    }
+  });
 });
 
 // ---------- 命令：/loop 解析与执行 ----------
 describe("parseLoopArgs", () => {
-  it("--effort max --verify \"npm test\" 解析正确", () => {
-    const parsed = parseLoopArgs("研究 X --effort max --verify \"npm test\"");
+  it('--effort max --verify "npm test" 解析正确', () => {
+    const parsed = parseLoopArgs('研究 X --effort max --verify "npm test"');
     expect(parsed.error).toBeUndefined();
     expect(parsed.task).toBe("研究 X");
     expect(parsed.effort).toBe("max");

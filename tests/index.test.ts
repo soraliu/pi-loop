@@ -24,7 +24,12 @@ describe("index 入口", () => {
     };
     expect(() => registerPiLoop(pi)).not.toThrow();
     expect(tools).toEqual(["loop_task"]);
-    expect(commands.sort()).toEqual(["loop", "loop-cases", "loop-methods", "loop-status"]);
+    expect(commands.sort()).toEqual([
+      "loop",
+      "loop-cases",
+      "loop-methods",
+      "loop-status",
+    ]);
   });
 
   it("无效宿主（undefined）→ fast-fail 抛错", () => {

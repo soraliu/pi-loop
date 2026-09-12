@@ -102,12 +102,12 @@ describe("createRunRecord", () => {
 		const recA = createRunRecord(dirA, "A 的任务", "low");
 		const recB = createRunRecord(dirB, "B 的任务", "low");
 		expect(recA.id).not.toBe(recB.id);
-		expect(
-			fs.existsSync(path.join(dirB, "runs", recA.id, "run.json")),
-		).toBe(false);
-		expect(
-			fs.existsSync(path.join(dirA, "runs", recB.id, "run.json")),
-		).toBe(false);
+		expect(fs.existsSync(path.join(dirB, "runs", recA.id, "run.json"))).toBe(
+			false,
+		);
+		expect(fs.existsSync(path.join(dirA, "runs", recB.id, "run.json"))).toBe(
+			false,
+		);
 	});
 });
 

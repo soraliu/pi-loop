@@ -19,7 +19,8 @@ const LoopTaskParamsSchema = Type.Object({
   ),
   verifyCommand: Type.Optional(
     Type.String({
-      description: "可选机器验收命令；提供时其退出码优先于 critic 打分作为迭代依据",
+      description:
+        "可选机器验收命令；提供时其退出码优先于 critic 打分作为迭代依据",
     }),
   ),
   contextPaths: Type.Optional(
@@ -56,19 +57,31 @@ function resultToText(result: LoopToolResult): string {
  * loop_task 执行体（stub）：校验 → 落 run 记录 → 返回占位结果。
  * 业务错误（task 缺失/effort 非法）转为 error content，不向宿主抛裸异常。
  */
-async function executeLoopTask(_toolCallId: string, rawParams: unknown): Promise<ToolResponse> {
+async function executeLoopTask(
+  _toolCallId: string,
+  rawParams: unknown,
+): Promise<ToolResponse> {
   // typebox 校验后的 params 形状与 SchemaParams 一致；此处收窄为业务类型
   const params = rawParams as SchemaParams;
   const loopParams: LoopToolParams = {
     task: params.task,
     // effort 由字符串窄化为合法档位：非法值由 runLoopTaskStub 内 resolveEffort 抛错
-    ...(params.effort === undefined ? {} : { effort: params.effort as LoopToolParams["effort"] }),
-    ...(params.verifyCommand === undefined ? {} : { verifyCommand: params.verifyCommand }),
-    ...(params.contextPaths === undefined ? {} : { contextPaths: params.contextPaths }),
+    ...(params.effort === undefined
+      ? {}
+      : { effort: params.effort as LoopToolParams["effort"] }),
+    ...(params.verifyCommand === undefined
+      ? {}
+      : { verifyCommand: params.verifyCommand }),
+    ...(params.contextPaths === undefined
+      ? {}
+      : { contextPaths: params.contextPaths }),
   };
   try {
     const result = runLoopTaskStub(loopParams);
-    return { content: [{ type: "text", text: resultToText(result) }], details: result };
+    return {
+      content: [{ type: "text", text: resultToText(result) }],
+      details: result,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {

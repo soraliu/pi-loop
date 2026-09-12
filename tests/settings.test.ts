@@ -68,11 +68,21 @@ describe("resolveEffort", () => {
 
 	it("合法档位返回对应预设的深拷贝", () => {
 		expect(resolveEffort("low").maxResultIterations).toBe(1);
-		expect(resolveEffort("max").metaTrigger).toEqual({ kind: "caseThreshold", count: 3 });
+		expect(resolveEffort("max").metaTrigger).toEqual({
+			kind: "caseThreshold",
+			count: 3,
+		});
 	});
 
 	it("非法档位抛 TypeError 且错误信息列举全部合法值", () => {
-		for (const bad of ["ultra", "", "MAX", 42, null, undefined === undefined ? "turbo" : "x"]) {
+		for (const bad of [
+			"ultra",
+			"",
+			"MAX",
+			42,
+			null,
+			undefined === undefined ? "turbo" : "x",
+		]) {
 			expect(() => resolveEffort(bad as never)).toThrow(TypeError);
 			try {
 				resolveEffort(bad as never);
@@ -117,7 +127,10 @@ describe("loadLoopSettings — 自定义覆盖（部分字段深合并）", () =
 		const settings = loadLoopSettings(dir);
 		expect(settings.effortPresets.max.maxResultIterations).toBe(7); // 覆盖生效
 		expect(settings.effortPresets.max.maxParallelSubagents).toBe(8); // 未给字段保持默认
-		expect(settings.effortPresets.max.metaTrigger).toEqual({ kind: "caseThreshold", count: 3 });
+		expect(settings.effortPresets.max.metaTrigger).toEqual({
+			kind: "caseThreshold",
+			count: 3,
+		});
 		expect(settings.effortPresets.low).toEqual(DEFAULT_EFFORT_PRESETS.low); // 其他档位不动
 	});
 
@@ -132,7 +145,10 @@ describe("loadLoopSettings — 自定义覆盖（部分字段深合并）", () =
 			}),
 		);
 		const settings = loadLoopSettings(dir);
-		expect(settings.effortPresets.low.metaTrigger).toEqual({ kind: "caseThreshold", count: 9 });
+		expect(settings.effortPresets.low.metaTrigger).toEqual({
+			kind: "caseThreshold",
+			count: 9,
+		});
 	});
 
 	it("形状非法的覆盖值被忽略并保持默认（宽松容错，不抛错）", () => {
@@ -141,7 +157,11 @@ describe("loadLoopSettings — 自定义覆盖（部分字段深合并）", () =
 			path.join(dir, "settings.json"),
 			JSON.stringify({
 				effortPresets: {
-					low: { maxResultIterations: "很多", maxParallelSubagents: -3, metaTrigger: { kind: "whenever" } },
+					low: {
+						maxResultIterations: "很多",
+						maxParallelSubagents: -3,
+						metaTrigger: { kind: "whenever" },
+					},
 					unknownLevel: { maxResultIterations: 1 }, // 非法档位名直接忽略
 				},
 			}),

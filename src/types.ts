@@ -12,9 +12,9 @@ export type EffortLevel = "low" | "medium" | "high" | "max";
  * - caseThreshold：累积新案例达到阈值后自动提议
  */
 export type MetaTrigger =
-  | { kind: "off" }
-  | { kind: "manual" }
-  | { kind: "caseThreshold"; count: number };
+	| { kind: "off" }
+	| { kind: "manual" }
+	| { kind: "caseThreshold"; count: number };
 
 /** 单档激进度预设（SPEC §6 表格的一行） */
 export interface EffortPreset {

@@ -13,7 +13,12 @@ import type {
 } from "../types.ts";
 
 /** 合法档位（resolveEffort 的枚举真源） */
-export const EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "max"];
+export const EFFORT_LEVELS: readonly EffortLevel[] = [
+	"low",
+	"medium",
+	"high",
+	"max",
+];
 
 /** 默认档位：未显式指定 effort 时的落点 */
 export const DEFAULT_EFFORT_LEVEL: EffortLevel = "medium";
@@ -44,7 +49,10 @@ export const DEFAULT_EFFORT_PRESETS: EffortPresetsMap = {
 
 /** 是否为合法档位字符串 */
 export function isEffortLevel(value: unknown): value is EffortLevel {
-	return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+	return (
+		typeof value === "string" &&
+		(EFFORT_LEVELS as readonly string[]).includes(value)
+	);
 }
 
 /**
@@ -65,7 +73,9 @@ export function resolveEffort(input?: EffortLevel): EffortPreset {
 
 /** MetaTrigger 的深拷贝（避免调用方篡改默认表） */
 function cloneMetaTrigger(t: MetaTrigger): MetaTrigger {
-	return t.kind === "caseThreshold" ? { kind: "caseThreshold", count: t.count } : { kind: t.kind };
+	return t.kind === "caseThreshold"
+		? { kind: "caseThreshold", count: t.count }
+		: { kind: t.kind };
 }
 
 /** 单档预设的部分覆盖合并：字段级深合并，未给字段保持默认 */
@@ -75,10 +85,18 @@ function mergePreset(base: EffortPreset, patch: unknown): EffortPreset {
 	}
 	const p = patch as Record<string, unknown>;
 	const merged: EffortPreset = { ...structuredClone(base) };
-	if (typeof p.maxResultIterations === "number" && Number.isInteger(p.maxResultIterations) && p.maxResultIterations >= 0) {
+	if (
+		typeof p.maxResultIterations === "number" &&
+		Number.isInteger(p.maxResultIterations) &&
+		p.maxResultIterations >= 0
+	) {
 		merged.maxResultIterations = p.maxResultIterations;
 	}
-	if (typeof p.maxParallelSubagents === "number" && Number.isInteger(p.maxParallelSubagents) && p.maxParallelSubagents >= 1) {
+	if (
+		typeof p.maxParallelSubagents === "number" &&
+		Number.isInteger(p.maxParallelSubagents) &&
+		p.maxParallelSubagents >= 1
+	) {
 		merged.maxParallelSubagents = p.maxParallelSubagents;
 	}
 	if (p.metaTrigger !== undefined && isMetaTrigger(p.metaTrigger)) {
@@ -91,9 +109,12 @@ function mergePreset(base: EffortPreset, patch: unknown): EffortPreset {
 function isMetaTrigger(value: unknown): value is MetaTrigger {
 	if (value === null || typeof value !== "object") return false;
 	const v = value as Record<string, unknown>;
-	if (v.kind === "off" || v.kind === "manual") return Object.keys(v).length === 1;
+	if (v.kind === "off" || v.kind === "manual")
+		return Object.keys(v).length === 1;
 	if (v.kind === "caseThreshold") {
-		return typeof v.count === "number" && Number.isInteger(v.count) && v.count >= 1;
+		return (
+			typeof v.count === "number" && Number.isInteger(v.count) && v.count >= 1
+		);
 	}
 	return false;
 }
@@ -121,14 +142,22 @@ export function loadLoopSettings(dataDir: string): LoopSettings {
 		return { effortPresets: structuredClone(DEFAULT_EFFORT_PRESETS) };
 	}
 	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-		console.warn(`[pi-loop] settings.json 顶层必须是对象（${settingsPath}），已回退默认配置`);
+		console.warn(
+			`[pi-loop] settings.json 顶层必须是对象（${settingsPath}），已回退默认配置`,
+		);
 		return { effortPresets: structuredClone(DEFAULT_EFFORT_PRESETS) };
 	}
 	const patches = (raw as Record<string, unknown>).effortPresets;
 	const presets = structuredClone(DEFAULT_EFFORT_PRESETS);
 	if (patches !== undefined) {
-		if (patches === null || typeof patches !== "object" || Array.isArray(patches)) {
-			console.warn(`[pi-loop] settings.json 的 effortPresets 必须是对象，该字段已忽略`);
+		if (
+			patches === null ||
+			typeof patches !== "object" ||
+			Array.isArray(patches)
+		) {
+			console.warn(
+				`[pi-loop] settings.json 的 effortPresets 必须是对象，该字段已忽略`,
+			);
 		} else {
 			for (const level of EFFORT_LEVELS) {
 				const patch = (patches as Record<string, unknown>)[level];

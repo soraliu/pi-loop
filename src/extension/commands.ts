@@ -50,7 +50,7 @@ export function parseLoopArgs(raw: string): ParsedLoopArgs {
       }
       case "--verify": {
         if (next === undefined) {
-          error = "--verify 缺少值（如 --verify \"npm test\"）";
+          error = '--verify 缺少值（如 --verify "npm test"）';
           break;
         }
         verifyCommand = next.replace(/^"|"$/g, "");
@@ -74,7 +74,8 @@ export function parseLoopArgs(raw: string): ParsedLoopArgs {
 
   const task = taskParts.join(" ").trim();
   if (!error && task.length === 0) {
-    error = "缺少任务描述。用法: /loop <任务描述> [--effort low|medium|high|max] [--verify \"命令\"] [--context 路径]";
+    error =
+      '缺少任务描述。用法: /loop <任务描述> [--effort low|medium|high|max] [--verify "命令"] [--context 路径]';
   }
   if (!error && effort !== undefined && !isEffortLevel(effort)) {
     error = `非法 effort 档位: ${effort}。合法值: low | medium | high | max`;
@@ -133,13 +134,16 @@ export function listRecentRuns(dataDir: string): Array<{
 /** 目录文件计数（/loop-cases、/loop-methods 的 stub 统计） */
 function countFiles(dir: string): number {
   if (!fs.existsSync(dir)) return 0;
-  return fs.readdirSync(dir).filter((name) => fs.statSync(path.join(dir, name)).isFile()).length;
+  return fs
+    .readdirSync(dir)
+    .filter((name) => fs.statSync(path.join(dir, name)).isFile()).length;
 }
 
 /** 注册全部 /loop* 命令 */
 export function registerLoopCommands(pi: PiExtensionApi): void {
   pi.registerCommand("loop", {
-    description: "启动一次 loop 任务（用法: /loop <任务> [--effort low|medium|high|max] [--verify \"命令\"] [--context 路径]）",
+    description:
+      '启动一次 loop 任务（用法: /loop <任务> [--effort low|medium|high|max] [--verify "命令"] [--context 路径]）',
     handler: (args: string, ctx: CommandContext) => {
       const parsed = parseLoopArgs(args);
       if (parsed.error !== undefined) {
@@ -149,8 +153,12 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
       const params: LoopToolParams = {
         task: parsed.task,
         ...(parsed.effort === undefined ? {} : { effort: parsed.effort }),
-        ...(parsed.verifyCommand === undefined ? {} : { verifyCommand: parsed.verifyCommand }),
-        ...(parsed.contextPaths === undefined ? {} : { contextPaths: parsed.contextPaths }),
+        ...(parsed.verifyCommand === undefined
+          ? {}
+          : { verifyCommand: parsed.verifyCommand }),
+        ...(parsed.contextPaths === undefined
+          ? {}
+          : { contextPaths: parsed.contextPaths }),
       };
       try {
         const result = runLoopTaskStub(params);
@@ -159,7 +167,10 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
           "info",
         );
       } catch (error) {
-        ctx.ui.notify(`执行失败: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(
+          `执行失败: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
       }
     },
   });
@@ -176,7 +187,10 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
       const lines = runs.map(
         (r) => `${r.id}  [${r.status}]  (effort=${r.effort})  ${r.taskPreview}`,
       );
-      ctx.ui.notify(`最近 ${lines.length} 条运行:\n${lines.join("\n")}`, "info");
+      ctx.ui.notify(
+        `最近 ${lines.length} 条运行:\n${lines.join("\n")}`,
+        "info",
+      );
     },
   });
 
@@ -185,7 +199,10 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
     handler: (_args: string, ctx: CommandContext) => {
       const dataDir = resolveDataDir();
       const count = countFiles(path.join(dataDir, "cases"));
-      ctx.ui.notify(`案例档案: ${count} 个文件（stub：案例存档在 M5 接入）`, "info");
+      ctx.ui.notify(
+        `案例档案: ${count} 个文件（stub：案例存档在 M5 接入）`,
+        "info",
+      );
     },
   });
 
@@ -194,7 +211,10 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
     handler: (_args: string, ctx: CommandContext) => {
       const dataDir = resolveDataDir();
       const count = countFiles(path.join(dataDir, "methods"));
-      ctx.ui.notify(`方法论库: ${count} 个文件（stub：方法条目在 M5 接入）`, "info");
+      ctx.ui.notify(
+        `方法论库: ${count} 个文件（stub：方法条目在 M5 接入）`,
+        "info",
+      );
     },
   });
 }
