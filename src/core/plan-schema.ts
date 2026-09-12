@@ -13,32 +13,19 @@
 //   - 绝不 mutate 输入：净化阶段把数据复制为全新的冻结普通对象再继续
 //   - 除三类危险键外字段一律原样保留（合法数据零损耗，未知键不误删）
 //   - 所有错误为中文人类可读句子，可直接拼接进 Designer 的重试 prompt
+//
+// M4-T1 起 deepSanitize/JsonValue 提取至 defend-json.ts（单一真源）——本模块的
+// 计划净化与 evaluator 的 critic 产物净化共同消费同一实现，语义偏差以
+// 本模块既有测试零回归为契约。
 
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 
+import { deepSanitize, type JsonValue } from "./defend-json.ts";
 import type { ResearchPlan } from "../types.ts";
 
-/** 原型污染攻击键：对象/数组任意层级一律剔除（含嵌套对象与数组内对象） */
-const DANGEROUS_KEYS: ReadonlySet<string> = new Set([
-	"__proto__",
-	"constructor",
-	"prototype",
-]);
-
-/**
- * 深度净化产物的域类型：与 JSON 数据同构（原始值，或递归冻结的普通对象/数组）。
- * 非 JSON 原始值（symbol/function/bigint 等）净化时折算为 undefined——
- * 计划的真源是 JSON 文本或已解析 JSON，此类值本就不该出现。
- */
-export type JsonValue =
-	| string
-	| number
-	| boolean
-	| null
-	| undefined
-	| { readonly [key: string]: JsonValue }
-	| readonly JsonValue[];
+// 向后兼容的原样转发：JsonValue 的公开出口保持不变（既有消费方无需改 import）
+export type { JsonValue } from "./defend-json.ts";
 
 /** 单个计划步骤的 schema（PlanStep 形状：model/guidance/acceptance 可选） */
 const planStepSchema = Type.Object({
@@ -99,36 +86,6 @@ function isPlainObject(
 	value: JsonValue,
 ): value is { readonly [key: string]: JsonValue } {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * 深度净化：把任意输入复制为全新的冻结普通对象/数组（绝不触碰原输入）。
- * - 三类危险键直接剔除（含嵌套对象与数组内对象）
- * - 只复制自有可枚举键——原型链上的属性天然被丢弃
- * - 其余字段原样递归保留（合法数据零损耗）
- */
-function deepSanitize(value: unknown): JsonValue {
-	if (Array.isArray(value)) {
-		return Object.freeze(value.map(deepSanitize));
-	}
-	if (value === null || typeof value !== "object") {
-		// SAFETY: typeof 已把 value 排除到 object 之外，只剩 JSON 原始值与 symbol/function/bigint
-		if (
-			typeof value === "string" ||
-			typeof value === "number" ||
-			typeof value === "boolean" ||
-			value === undefined
-		) {
-			return value;
-		}
-		return undefined; // symbol/function/bigint：非 JSON 值，折算丢弃
-	}
-	const clean: Record<string, JsonValue> = {};
-	for (const [key, entry] of Object.entries(value)) {
-		if (DANGEROUS_KEYS.has(key)) continue;
-		clean[key] = deepSanitize(entry);
-	}
-	return Object.freeze(clean);
 }
 
 /** sanitizePlanJson 的结果：ok 时 value 为净化后的冻结副本；失败时 error 为可读原因 */

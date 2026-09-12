@@ -189,3 +189,27 @@ export interface IterationEntry {
 	/** 失败原因（status=failed 时） */
 	error?: string;
 }
+
+/* ================================================================
+ * 评估结论（M4-T1：Evaluator 的输出形状——verifyCommand 机器断言或 critic rubric 二择其一的产物）
+ * ================================================================ */
+
+/**
+ * Evaluator 的评估结论（src/core/evaluator.ts 的返回；M4-T2 起落入 RunRecord.evaluation
+ * 与 LoopToolResult 摘要）。
+ * 诚实遥测（SPEC §7.4）：verified 只能来自 verifyCommand 的机器断言或 critic 结论
+ * 原文——evaluator 自身的任何故障一律收敛为 fail（不自判通过）。
+ */
+export interface Evaluation {
+	/** 结论三态：verified=验收通过；partial=部分达成（判定权在 critic——机器断言不产生中间态）；fail=未通过 */
+	verdict: "verified" | "partial" | "fail";
+	/** 0 到 100 的整数分（evaluator 对一切来源的输入 clamp 到该区间） */
+	score: number;
+	/**
+	 * 结论依据（中文可读句子数组）。verifyCommand 通道携带退出码/stderr 尾部等执行事实；
+	 * critic 通道为 critic 围栏 JSON 的 reasons 原文（外加幽灵 blame 过滤的警告）。
+	 */
+	reasons: string[];
+	/** 归因 stepId 列表：critic 通道来自 critic 指认（已过滤不存在的 id）；verifyCommand 机器断言通道恒为空数组——退出码没有轮次归因概念（细节在 reasons） */
+	blame: string[];
+}
