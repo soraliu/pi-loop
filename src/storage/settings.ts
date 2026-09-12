@@ -23,26 +23,30 @@ export const EFFORT_LEVELS: readonly EffortLevel[] = [
 /** 默认档位：未显式指定 effort 时的落点 */
 export const DEFAULT_EFFORT_LEVEL: EffortLevel = "medium";
 
-/** SPEC §6 预设表：唯一权威数据源（settings.json 可深合并覆盖） */
+/** SPEC §6 预设表：唯一权威数据源（settings.json 可深合并覆盖；maxPlanSteps 为 M3-T1 增补） */
 export const DEFAULT_EFFORT_PRESETS: EffortPresetsMap = {
 	low: {
 		maxResultIterations: 1,
 		maxParallelSubagents: 2,
+		maxPlanSteps: 3,
 		metaTrigger: { kind: "off" },
 	},
 	medium: {
 		maxResultIterations: 2,
 		maxParallelSubagents: 4,
+		maxPlanSteps: 5,
 		metaTrigger: { kind: "manual" },
 	},
 	high: {
 		maxResultIterations: 3,
 		maxParallelSubagents: 6,
+		maxPlanSteps: 8,
 		metaTrigger: { kind: "caseThreshold", count: 5 },
 	},
 	max: {
 		maxResultIterations: 5,
 		maxParallelSubagents: 8,
+		maxPlanSteps: 12,
 		metaTrigger: { kind: "caseThreshold", count: 3 },
 	},
 };
@@ -98,6 +102,14 @@ function mergePreset(base: EffortPreset, patch: unknown): EffortPreset {
 		p.maxParallelSubagents >= 1
 	) {
 		merged.maxParallelSubagents = p.maxParallelSubagents;
+	}
+	// maxPlanSteps（M3-T1）：计划步数预算硬顶；非法值忽略回落默认（同其他键的宽松容错）
+	if (
+		typeof p.maxPlanSteps === "number" &&
+		Number.isInteger(p.maxPlanSteps) &&
+		p.maxPlanSteps >= 1
+	) {
+		merged.maxPlanSteps = p.maxPlanSteps;
 	}
 	if (p.metaTrigger !== undefined && isMetaTrigger(p.metaTrigger)) {
 		merged.metaTrigger = cloneMetaTrigger(p.metaTrigger);

@@ -31,26 +31,30 @@ afterAll(() => {
 });
 
 describe("DEFAULT_EFFORT_PRESETS（SPEC §6 权威数据）", () => {
-	it("四个档位齐全且数值与 SPEC §6 表格一致", () => {
+	it("四个档位齐全且数值与 SPEC §6 表格一致（maxPlanSteps 为 M3-T1 增补：3/5/8/12）", () => {
 		expect(EFFORT_LEVELS).toEqual(["low", "medium", "high", "max"]);
 		expect(DEFAULT_EFFORT_PRESETS.low).toEqual({
 			maxResultIterations: 1,
 			maxParallelSubagents: 2,
+			maxPlanSteps: 3,
 			metaTrigger: { kind: "off" },
 		});
 		expect(DEFAULT_EFFORT_PRESETS.medium).toEqual({
 			maxResultIterations: 2,
 			maxParallelSubagents: 4,
+			maxPlanSteps: 5,
 			metaTrigger: { kind: "manual" },
 		});
 		expect(DEFAULT_EFFORT_PRESETS.high).toEqual({
 			maxResultIterations: 3,
 			maxParallelSubagents: 6,
+			maxPlanSteps: 8,
 			metaTrigger: { kind: "caseThreshold", count: 5 },
 		});
 		expect(DEFAULT_EFFORT_PRESETS.max).toEqual({
 			maxResultIterations: 5,
 			maxParallelSubagents: 8,
+			maxPlanSteps: 12,
 			metaTrigger: { kind: "caseThreshold", count: 3 },
 		});
 		expect(DEFAULT_EFFORT_LEVEL).toBe("medium");
@@ -171,6 +175,54 @@ describe("loadLoopSettings — 自定义覆盖（部分字段深合并）", () =
 		expect(settings.effortPresets.low.maxParallelSubagents).toBe(2);
 		expect(settings.effortPresets.low.metaTrigger).toEqual({ kind: "off" });
 		expect(settings.effortPresets).not.toHaveProperty("unknownLevel");
+	});
+});
+
+describe("loadLoopSettings — maxPlanSteps（M3-T1 新键：容缺省合并）", () => {
+	it("老 settings.json（未给 maxPlanSteps）回落默认 3/5/8/12", () => {
+		const dir = makeTempDir();
+		fs.writeFileSync(
+			path.join(dir, "settings.json"),
+			JSON.stringify({
+				effortPresets: { medium: { maxResultIterations: 3 } }, // 老键照常覆盖
+			}),
+		);
+		const settings = loadLoopSettings(dir);
+		expect(settings.effortPresets.medium.maxResultIterations).toBe(3); // 老键覆盖生效
+		expect(settings.effortPresets.medium.maxPlanSteps).toBe(5); // 新键缺省回落
+		expect(settings.effortPresets.medium.maxParallelSubagents).toBe(4);
+		expect(settings.effortPresets.low.maxPlanSteps).toBe(3); // 未触碰档位全默认
+	});
+
+	it("显式覆盖 maxPlanSteps 生效，未覆盖档位保持默认", () => {
+		const dir = makeTempDir();
+		fs.writeFileSync(
+			path.join(dir, "settings.json"),
+			JSON.stringify({
+				effortPresets: { high: { maxPlanSteps: 4 } },
+			}),
+		);
+		const settings = loadLoopSettings(dir);
+		expect(settings.effortPresets.high.maxPlanSteps).toBe(4);
+		expect(settings.effortPresets.medium.maxPlanSteps).toBe(5);
+	});
+
+	it("非法覆盖值（0 / 字符串 / 小数）被忽略并保持默认", () => {
+		const dir = makeTempDir();
+		fs.writeFileSync(
+			path.join(dir, "settings.json"),
+			JSON.stringify({
+				effortPresets: {
+					medium: { maxPlanSteps: 0 },
+					high: { maxPlanSteps: "8" },
+					max: { maxPlanSteps: 2.5 },
+				},
+			}),
+		);
+		const settings = loadLoopSettings(dir);
+		expect(settings.effortPresets.medium.maxPlanSteps).toBe(5);
+		expect(settings.effortPresets.high.maxPlanSteps).toBe(8);
+		expect(settings.effortPresets.max.maxPlanSteps).toBe(12);
 	});
 });
 

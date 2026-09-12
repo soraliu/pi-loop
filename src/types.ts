@@ -22,6 +22,8 @@ export interface EffortPreset {
 	maxResultIterations: number;
 	/** 并行 subagents 数量上限 */
 	maxParallelSubagents: number;
+	/** 计划步骤数上限（预算硬上限之一，SPEC §7.3——研究计划步数超界即拒收预算耗尽） */
+	maxPlanSteps: number;
 	/** meta 自迭代触发条件 */
 	metaTrigger: MetaTrigger;
 }
@@ -93,7 +95,7 @@ export interface LoopSettings {
 }
 
 /* ================================================================
- * 研究计划与迭代（M2-T2：静态计划 + 编译器的类型基础）
+ * 研究计划与迭代（M2-T2：静态计划 + 编译器的类型基础；M3-T1：ResearchPlan）
  * ================================================================ */
 
 /** 研究计划的单个步骤（M3 的 Designer 将动态生成；M2 由 BUILTIN_PLAN 静态提供） */
@@ -108,11 +110,35 @@ export interface PlanStep {
 	dependsOn: string[];
 	/** 模型覆盖（M2 全部省略——spawn 一律继承会话默认模型） */
 	model?: string;
+	/** 附加提示词引导（可选：Designer 对本步的补充指引，随任务提示词下发） */
+	guidance?: string;
+	/** 验证标准（可选：本步产出的验收标准——M4 evaluator 消费预留） */
+	acceptance?: string;
 }
 
-/** 研究计划：步骤的 DAG（M2 由 BUILTIN_PLAN 静态构造，M3 由 Designer 动态生成） */
+/**
+ * 研究计划的「步骤 DAG 视图」：编译器（compileWorkflowScript）与调度内核（executePlan）
+ * 的输入契约——两者只消费 steps，不强求计划级元数据。
+ * M3-T1 起全量计划形状为 ResearchPlan（本接口的超集，结构兼容可直接喂给两者）。
+ */
 export interface PlanDraft {
 	steps: PlanStep[];
+}
+
+/**
+ * 全量研究计划（M3-T1）：Designer 动态产物与 BUILTIN_PLAN 静态计划的统一形状。
+ * 外部输入（模型输出 / JSON 文本）须经 plan-schema 的防御解析
+ * （净化 + schema 校验 + 结构语义校验）后才成为本类型。
+ */
+export interface ResearchPlan extends PlanDraft {
+	/** 计划结构版本（当前固定字面量 1——保留给未来不兼容演进） */
+	version: 1;
+	/** 计划针对的任务全文（loop_task 的 task 入参） */
+	task: string;
+	/** 计划来源：designer=方法设计器动态生成；builtin=内置静态计划 */
+	origin: "designer" | "builtin";
+	/** 设计备注（可选：Designer 的说明/假设/取舍，不参与调度） */
+	notes?: string;
 }
 
 /**

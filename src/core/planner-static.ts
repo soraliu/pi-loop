@@ -1,18 +1,24 @@
 // pi-loop 静态计划与 workflowScript 编译器（M2-T2）
 // 依据 docs/plans/m2-orchestrator.md T2、docs/SPEC.md §4（Orchestrator 契约）。
 //
-// 职责：把 PlanDraft（步骤 DAG）编译为 pi-subagents 可执行的 workflowScript 字符串。
+// 职责：把 PlanDraft（步骤 DAG 视图）编译为 pi-subagents 可执行的 workflowScript 字符串；
+// 全量计划形状 ResearchPlan（M3-T1）是 PlanDraft 的结构超集，直接可喂。
 // 安全不变式：所有动态值（agent/task）一律 JSON.stringify 后嵌入字符串字面量位置，
 // 使引号/反引号/${}/换行均被转义，调用方注入的文本无法逃逸出字符串字面量。
 
-import type { PlanDraft, PlanStep } from "../types.ts";
+import type { PlanDraft, PlanStep, ResearchPlan } from "../types.ts";
 
 /**
  * 内置"标准研究"静态计划（M2 最小闭环主线）。
- * M3 的 Designer 将以动态生成替代本函数；接口（入参任务全文、出参 PlanDraft）保持不变。
+ * M3 的 Designer 将以动态生成替代本函数；M3-T1 起出参升级为 ResearchPlan
+ * （origin 固定 "builtin"），入参（任务全文）保持不变。compileWorkflowScript
+ * 与 executePlan 按 PlanDraft 视图消费（只读 steps），结构兼容无需调整。
  */
-export function BUILTIN_PLAN(task: string): PlanDraft {
+export function BUILTIN_PLAN(task: string): ResearchPlan {
 	return {
+		version: 1,
+		task,
+		origin: "builtin",
 		steps: [
 			{
 				id: "research",
