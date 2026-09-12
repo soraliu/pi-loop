@@ -84,7 +84,11 @@ export class SubagentsRpcClient {
 	 * 发起一次 RPC 请求并等待对应 reply。
 	 * @throws RpcError 超时或 success:false（error.code/message 透传）
 	 */
-	request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
+	request<T = unknown>(
+		method: string,
+		params?: unknown,
+		timeoutMs?: number,
+	): Promise<T> {
 		const requestId = randomUUID();
 		const timeout = timeoutMs ?? this.defaultTimeoutMs;
 		return new Promise<T>((resolve, reject) => {
@@ -108,13 +112,22 @@ export class SubagentsRpcClient {
 				}
 				const code = reply.error?.code;
 				const message = reply.error?.message ?? "未知 RPC 错误";
-				reject(new RpcError(`RPC ${method} 失败: ${message}`, method, requestId, code));
+				reject(
+					new RpcError(`RPC ${method} 失败: ${message}`, method, requestId, code),
+				);
 			};
 			const timer = setTimeout(() => {
 				if (settled) return;
 				settled = true;
 				this.detach(eventName, handler, unsubscribe);
-				reject(new RpcError(`RPC ${method} 超时（${timeout}ms 无 reply）`, method, requestId, "timeout"));
+				reject(
+					new RpcError(
+						`RPC ${method} 超时（${timeout}ms 无 reply）`,
+						method,
+						requestId,
+						"timeout",
+					),
+				);
 			}, timeout);
 
 			unsubscribe = this.bus.on(eventName, handler);
@@ -132,7 +145,10 @@ export class SubagentsRpcClient {
 	 * @param runId 期待完成的 run id；缺省时任何完成事件都命中
 	 * @returns 命中的事件 payload；超时返回 null（调用方决定语义）
 	 */
-	waitForCompletion(runId: string | undefined, timeoutMs?: number): Promise<unknown | null> {
+	waitForCompletion(
+		runId: string | undefined,
+		timeoutMs?: number,
+	): Promise<unknown | null> {
 		const timeout = timeoutMs ?? this.defaultTimeoutMs;
 		return new Promise((resolve) => {
 			let settled = false;
@@ -170,8 +186,20 @@ export class SubagentsRpcClient {
 	 * spawn 一个 async run。注意返回值是"受理信息"（可能含 runId），
 	 * 完成需另行 waitForCompletion。
 	 */
-	spawn(params: { workflowScript?: string; agent?: string; task?: string; context?: string }, timeoutMs?: number): Promise<SpawnAcceptance> {
-		return this.request("spawn", { context: "fresh", ...params }, timeoutMs) as Promise<SpawnAcceptance>;
+	spawn(
+		params: {
+			workflowScript?: string;
+			agent?: string;
+			task?: string;
+			context?: string;
+		},
+		timeoutMs?: number,
+	): Promise<SpawnAcceptance> {
+		return this.request(
+			"spawn",
+			{ context: "fresh", ...params },
+			timeoutMs,
+		) as Promise<SpawnAcceptance>;
 	}
 
 	/** 停止一个 async run */
@@ -192,7 +220,9 @@ export class SubagentsRpcClient {
 		if (typeof unsubscribe === "function") {
 			(unsubscribe as () => void)();
 		} else if (unsubscribe !== undefined) {
-			console.warn("[pi-loop] bus.on 返回了非函数值，无法卸载 listener（可能泄漏）");
+			console.warn(
+				"[pi-loop] bus.on 返回了非函数值，无法卸载 listener（可能泄漏）",
+			);
 		}
 	}
 }

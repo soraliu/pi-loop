@@ -43,7 +43,8 @@ class FakeBus implements SubagentEventBus {
 
 	/** 对最近一个未回复的 request 回复（不消费队列——重复 reply 场景需要重放） */
 	replyLast(payload: Omit<RpcReply, "requestId">): void {
-		if (this.requests.length === 0) throw new Error("fake bus: 尚无 request 可回复");
+		if (this.requests.length === 0)
+			throw new Error("fake bus: 尚无 request 可回复");
 		const { requestId } = this.requests[this.requests.length - 1];
 		this.emit(`subagents:rpc:v1:reply:${requestId}`, { requestId, ...payload });
 	}
@@ -62,7 +63,11 @@ describe("SubagentsRpcClient.request", () => {
 		bus.replyLast({ success: true, data: { pong: true } });
 		await expect(pending).resolves.toEqual({ pong: true });
 		// 协议包字段校验：version/requestId/method 齐备
-		const req = bus.requests[0].payload as { version: number; requestId: string; method: string };
+		const req = bus.requests[0].payload as {
+			version: number;
+			requestId: string;
+			method: string;
+		};
 		expect(req.version).toBe(1);
 		expect(req.method).toBe("ping");
 		expect(req.requestId).toMatch(/^[0-9a-f-]{36}$/);
@@ -72,9 +77,15 @@ describe("SubagentsRpcClient.request", () => {
 		const bus = new FakeBus();
 		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 1000 });
 		const pending = client.request("spawn", { agent: "x" });
-		bus.replyLast({ success: false, error: { code: "NOT_READY", message: "subagents 未就绪" } });
+		bus.replyLast({
+			success: false,
+			error: { code: "NOT_READY", message: "subagents 未就绪" },
+		});
 		await expect(pending).rejects.toThrow(/subagents 未就绪/);
-		await expect(pending).rejects.toMatchObject({ code: "NOT_READY", method: "spawn" });
+		await expect(pending).rejects.toMatchObject({
+			code: "NOT_READY",
+			method: "spawn",
+		});
 	});
 
 	it("超时 → reject 且错误标 timeout", async () => {
@@ -92,7 +103,11 @@ describe("SubagentsRpcClient.request", () => {
 		// 乱序回复：3 → 1 → 2
 		const ids = bus.requests.map((r) => r.requestId);
 		const reply = (requestId: string, data: string) =>
-			bus.emit(`subagents:rpc:v1:reply:${requestId}`, { requestId, success: true, data });
+			bus.emit(`subagents:rpc:v1:reply:${requestId}`, {
+				requestId,
+				success: true,
+				data,
+			});
 		reply(ids[2], "third");
 		reply(ids[0], "first");
 		reply(ids[1], "second");

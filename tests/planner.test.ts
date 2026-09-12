@@ -67,11 +67,52 @@ describe("compileWorkflowScript — 单步", () => {
 		expect(captured[0].agent).toBe("researcher");
 	});
 
-	it("task 含反引号/模板插值时全部被转义", () => {
+	it("task 含反引号/模板插值时全部被转义（evil2 执行级验证）", async () => {
 		const evil2 = "`${process.env.PATH}` + `";
 		const script2 = compileWorkflowScript(BUILTIN_PLAN(evil2));
-		// 双引号字面量内 ${} 与反引号均无特殊含义；只要求转义后的原文完整在场
+		// 双引号字面量内 ${} 与反引号均无特殊含义；转义后的原文完整在场
 		expect(script2).toContain(JSON.stringify(evil2).slice(1, -1));
+
+		// 执行级验证：产物里的 `${process.env.PATH}` 是字符串字面量内容而非模板插值——
+		// 真跑时插值不会发生（若逃逸，捕获值会变成环境变量内容而非原文）
+		const captured: Array<{ key: string; agent: string; task: string }> = [];
+		const runs = {
+			run: async (key: string, opts: { agent: string; task: string }) => {
+				captured.push({ key, ...opts });
+				return { ok: true };
+			},
+			all: async (items: Array<{ key: string; agent: string; task: string }>) =>
+				items.map((it) => captured.push(it)),
+		};
+		const result = await new Function(
+			"runs",
+			`return (async () => {\n${script2}\n})()`,
+		)(runs);
+		expect(captured).toHaveLength(1);
+		expect(captured[0].task).toBe(evil2); // 原文原样到达——插值未发生
+		expect(result).toEqual({ research: { ok: true } });
+	});
+
+	it("agent 名注入样例：动态 agent 走同一 lit() 管线，原样到达参数位", async () => {
+		const evilAgent = 'x" }); require("node:fs").readFileSync("/etc/passwd"); ("';
+		const plan: PlanDraft = {
+			steps: [step({ id: "s", agent: evilAgent, task: "正常任务文本" })],
+		};
+		const script = compileWorkflowScript(plan);
+
+		const captured: Array<{ key: string; agent: string; task: string }> = [];
+		const runs = {
+			run: async (key: string, opts: { agent: string; task: string }) => {
+				captured.push({ key, ...opts });
+				return { ok: true };
+			},
+			all: async (items: Array<{ key: string; agent: string; task: string }>) =>
+				items.map((it) => captured.push(it)),
+		};
+		await new Function("runs", `return (async () => {\n${script}\n})()`)(runs);
+		expect(captured).toHaveLength(1);
+		expect(captured[0].agent).toBe(evilAgent); // 引号不逃逸、require 不执行
+		expect(captured[0].task).toBe("正常任务文本");
 	});
 
 	it("含换行的 task 产出 \\n 转义（保持单行语句）", () => {
@@ -148,6 +189,14 @@ describe("compileWorkflowScript — 负例", () => {
 			steps: [step({ id: "a", dependsOn: ["ghost"] })],
 		};
 		expect(() => compileWorkflowScript(plan)).toThrow(/不存在的步骤 "ghost"/);
+	});
+
+	it("dependsOn 重复项 → 保守报环（防回归锁定：计数式 Kahn 对重复依赖项的既有行为）", () => {
+		const plan: PlanDraft = {
+			steps: [step({ id: "a" }), step({ id: "b", dependsOn: ["a", "a"] })],
+		};
+		// 已预先接受的行为：重复依赖项使入度清零失败 → 报环拒绝而非产出坏脚本
+		expect(() => compileWorkflowScript(plan)).toThrow(/依赖环/);
 	});
 
 	it("空计划 → 抛错", () => {

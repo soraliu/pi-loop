@@ -71,7 +71,8 @@ export interface RunSummary {
 	/** 任务描述单行预览（截断） */
 	taskPreview: string;
 	effort: EffortLevel;
-	status: LoopToolResult["status"] | "created";
+	/** 含 "running"（M2-T3 引入：run.json 运行中态——计划状态机 created→running→completed|failed） */
+	status: LoopToolResult["status"] | "created" | "running";
 	/** ISO 8601 创建时间 */
 	createdAt: string;
 }
