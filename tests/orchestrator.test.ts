@@ -392,6 +392,50 @@ describe("executePlan — 失败路径", () => {
 			"c:failed",
 		]);
 		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
+		// M3-T4 顺手（T3 review M2 收口）：outcome.error 镜像未随 budget 门控——
+		// no-budget abort 的返回形是 additive 变化（error 在场、batches 缺席），入档锁定
+		expect(outcome.error).toBe("aborted");
+		expect("batches" in outcome).toBe(false);
+	});
+});
+
+describe("executePlan — spawn 失败归因（M-1：仅超时/无应答附安装引导）", () => {
+	it("code=timeout 的受理失败 → 错误附安装引导（结构化判据，非仅文案匹配）", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		// 消息不含“超时/无 reply”字样——引导后缀只能来自 code==="timeout" 判据
+		const timeoutLike = new Error("RPC spawn 失败: 客户端放弃等待应答");
+		(timeoutLike as Error & { code?: string }).code = "timeout";
+		fake.spawnError = timeoutLike;
+		const outcome = await executePlan(fanPlan(), { rpc: fake, runId, dataDir });
+
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		expect(final.iterations).toHaveLength(2); // b、c 均在受理层被拒；a 未尝试
+		for (const entry of final.iterations) {
+			expect(entry.error).toContain("放弃等待应答");
+			expect(entry.error).toContain("请安装 pi-subagents");
+			expect(entry.startedAt).toBeUndefined(); // 未受理即失败：无 running 态痕迹
+		}
+		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
+	});
+
+	it("真实拒绝（agent 不存在）→ 原样报错，不附安装引导（不误归因为未安装）", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		const rejected = new Error('RPC spawn 失败: Agent "worker-b" 不存在');
+		(rejected as Error & { code?: string }).code = "agent_not_found";
+		fake.spawnError = rejected;
+		const outcome = await executePlan(fanPlan(), { rpc: fake, runId, dataDir });
+
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		for (const entry of final.iterations) {
+			expect(entry.error).toContain('Agent "worker-b" 不存在');
+			expect(entry.error).not.toContain("请安装 pi-subagents");
+			expect(entry.error).not.toContain("pi-subagents 不在或不可用");
+		}
+		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
 	});
 });
 

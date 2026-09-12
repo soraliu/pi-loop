@@ -7,7 +7,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { EffortLevel, IterationEntry, RunSummary } from "../types.ts";
+import type {
+	EffortLevel,
+	IterationEntry,
+	RunPlanInfo,
+	RunSummary,
+} from "../types.ts";
 
 /** 生产环境默认数据根目录（~/.pi/loop/） */
 export function defaultDataDir(): string {
@@ -20,6 +25,8 @@ export interface RunRecord extends RunSummary {
 	task: string;
 	/** 迭代记录（Orchestrator 按计划步骤追加；M1 阶段恒为空数组） */
 	iterations: IterationEntry[];
+	/** 计划元信息（M3-T4：designer 生成/降级的诚实遥测——generatePlan 返回即写，执行中不变） */
+	plan?: RunPlanInfo;
 }
 
 /** run id：`r-<epoch36>` 加短随机后缀，防同毫秒碰撞且按创建时间天然有序 */

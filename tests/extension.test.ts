@@ -543,7 +543,16 @@ describe("runLoopTask 真实路径", () => {
         "research:succeeded",
       ]);
       expect(updates[1]?.summary).toContain("tokio");
-      // run.json 终态（与列表视图一致）
+      // M3-T4 接线：通用 fake 应答无产物文件/围栏 → designer 3 次校验尝试耗尽后降级
+      // builtin 照跑（M2 等价链路）；LoopToolResult.plan 如实带 origin/steps/degraded
+      // （降级禁止冒充正常生成）
+      expect(result.plan).toEqual({
+        origin: "builtin",
+        steps: 1,
+        degraded: true,
+      });
+      // run.json 终态（与列表视图一致；plan 全量元信息入档——origin/steps/notes/
+      // degraded/channel/attempts）
       const record = JSON.parse(
         fs.readFileSync(
           path.join(tmp, "runs", result.runId, "run.json"),
@@ -551,8 +560,26 @@ describe("runLoopTask 真实路径", () => {
         ),
       ) as {
         status: string;
+        plan?: {
+          origin: string;
+          steps: number;
+          notes?: string;
+          degraded?: boolean;
+          channel?: string;
+          attempts?: number;
+        };
         iterations: Array<Record<string, unknown>>;
       };
+      expect(record.plan).toMatchObject({
+        origin: "builtin",
+        steps: 1,
+        degraded: true,
+        channel: "builtin",
+        attempts: 3,
+      });
+      expect(record.plan?.notes).toContain(
+        "designer 降级：连续 3 次尝试均未通过校验",
+      );
       expect(record.status).toBe("completed");
       expect(record.iterations).toHaveLength(1);
       expect(record.iterations[0]).toMatchObject({
@@ -681,9 +708,12 @@ describe("loop_task 工具 — 真实调度", () => {
         succeeded: 1,
         iterations: 1,
       });
-      // 工具文本面：真值序列化进 content（status/遥测可见）
+      // 工具文本面：真值序列化进 content（status/遥测/计划摘要可见）
       expect(res.content[0].text).toContain('"completed"');
       expect(res.content[0].text).toContain('"telemetry"');
+      // M3-T4：计划摘要进工具可见文本（designer 降级路径 → origin=builtin/degraded）
+      expect(res.content[0].text).toContain('"plan"');
+      expect(res.content[0].text).toContain('"builtin"');
       // 宿主 onUpdate：两段进度（running → succeeded），文案含步骤与状态
       expect(hostUpdates).toHaveLength(2);
       expect(hostUpdates[0].content[0]?.text).toContain("research");
@@ -725,7 +755,7 @@ describe("loop_task 工具 — 真实调度", () => {
 
 // ---------- M2-T4：/loop 命令真实路径与进度节流 ----------
 describe("/loop 命令 — 真实调度与进度节流", () => {
-  it("真实路径（fake 总线经 pi.events 注入）→ 每步一条进度 + 完成摘要", async () => {
+  it("真实路径（fake 总线经 pi.events 注入）→ 开始 + 每步终态进度 + 完成摘要", async () => {
     const tmp = makeTempDir();
     const saved = setLoopEnv(tmp, "real");
     try {
@@ -733,13 +763,17 @@ describe("/loop 命令 — 真实调度与进度节流", () => {
       registerLoopCommands(pi);
       const { ctx, messages } = makeNotifyCtx();
       await commands.get("loop")!.handler("研究 X --effort low", ctx);
-      // 单步计划：1 条进度（research 开始）+ 1 条完成摘要——每步一条的命令下限
-      expect(messages).toHaveLength(2);
+      // 单步计划：1 条开始 + 1 条终态（T4-M2：终态可见性）+ 1 条完成摘要
+      expect(messages).toHaveLength(3);
       expect(messages[0].level).toBe("info");
       expect(messages[0].text).toContain("research");
       expect(messages[0].text).toContain("[loop]");
-      expect(messages[1].text).toMatch(/r-[a-z0-9-]+/);
-      expect(messages[1].text).toContain("1/1");
+      expect(messages[0].text).toContain("开始执行");
+      expect(messages[1].level).toBe("info");
+      expect(messages[1].text).toContain("research");
+      expect(messages[1].text).toContain("执行完成");
+      expect(messages[2].text).toMatch(/r-[a-z0-9-]+/);
+      expect(messages[2].text).toContain("1/1");
       const runs = listRecentRuns(tmp);
       expect(runs).toHaveLength(1);
       expect(runs[0].effort).toBe("low");
@@ -749,37 +783,39 @@ describe("/loop 命令 — 真实调度与进度节流", () => {
     }
   });
 
-  it("节流器：3 步 onUpdate（每步 running+succeeded+迟到重复）→ notify 恰好 3 条", () => {
+  it("节流器（新语义）：3 步含 1 失败 → 1 条开始 + 3 条终态，迟到重复终态去重", () => {
     const messages: Array<{ text: string; level?: string }> = [];
     const notify = makeStepNotifier((text, level) =>
       messages.push({ text, level }),
     );
-    // 3 步、每步两段（running → succeeded 带摘要），外加一步迟到的重复更新
+    // 3 步先到达各自 running（开始信号只发首条，其余并入），再到达终态（critic 失败）
     for (const stepId of ["research", "verify", "critic"]) {
       notify({ stepId, agent: "researcher", status: "running" });
-      notify({
-        stepId,
-        agent: "researcher",
-        status: "succeeded",
-        summary: "结论",
-      });
     }
-    notify({ stepId: "research", agent: "researcher", status: "succeeded" });
-    // 按步去重：恰好 3 条、各对应一个 stepId（首条胜出）
-    expect(messages).toHaveLength(3);
-    expect(messages.map((m) => m.text)).toEqual([
-      expect.stringContaining("research"),
-      expect.stringContaining("verify"),
-      expect.stringContaining("critic"),
-    ]);
-    expect(messages.every((m) => m.level === "info")).toBe(true);
-    // 失败步的首条更新走 error 级
-    makeStepNotifier((text, level) => messages.push({ text, level }))({
-      stepId: "dead",
-      agent: "critic",
-      status: "failed",
+    notify({
+      stepId: "research",
+      agent: "researcher",
+      status: "succeeded",
+      summary: "结论",
     });
+    notify({ stepId: "verify", agent: "researcher", status: "succeeded" });
+    notify({ stepId: "critic", agent: "researcher", status: "failed" });
+    // 迟到的重复终态（同 stepId 同终态）：去重吞掉——不产生第 5 条
+    notify({ stepId: "critic", agent: "researcher", status: "failed" });
+    notify({ stepId: "research", agent: "researcher", status: "succeeded" });
+    // 目标语义：notify 数 = 开始条数(1) + 终态条数(3) = 4
     expect(messages).toHaveLength(4);
+    expect(messages[0].text).toContain("research");
+    expect(messages[0].text).toContain("开始执行");
+    expect(messages[0].level).toBe("info");
+    expect(messages[1].text).toContain("research");
+    expect(messages[1].text).toContain("执行完成");
+    expect(messages[1].level).toBe("info");
+    expect(messages[2].text).toContain("verify");
+    expect(messages[2].text).toContain("执行完成");
+    expect(messages[2].level).toBe("info");
+    expect(messages[3].text).toContain("critic");
+    expect(messages[3].text).toContain("执行失败");
     expect(messages[3].level).toBe("error");
   });
 });

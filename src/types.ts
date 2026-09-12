@@ -57,6 +57,33 @@ export interface RunTelemetry {
 	durationMs: number;
 }
 
+/**
+ * 计划元信息摘要（LoopToolResult.plan，M3-T4 接线）：工具结果侧可见的最小集合。
+ * 全量元信息（notes/channel/attempts）不存在这一层——那是 run.json 审计域。
+ */
+export interface LoopPlanBrief {
+	/** 计划来源：designer=动态生成；builtin=内置静态计划（含 designer 降级产物） */
+	origin: "designer" | "builtin";
+	/** 计划步骤数 */
+	steps: number;
+	/** 是否为降级产物（诚实遥测：降级禁止冒充正常生成） */
+	degraded?: boolean;
+}
+
+/**
+ * 计划元信息全量（RunRecord.plan，M3-T4 接线）：DesignerOutcome 的落盘形。
+ * channel 三值与 src/core/designer.ts 的产物通道定义同源（此处声明结构，避免
+ * types ← designer 的反向依赖）。
+ */
+export interface RunPlanInfo extends LoopPlanBrief {
+	/** 设计备注（designer 计划的假设/取舍；降级时如实记降级原因） */
+	notes?: string;
+	/** 产物提取通道：file=designer-plan.json；fence=完成回复围栏；builtin=降级 */
+	channel?: "file" | "fence" | "builtin";
+	/** designer 实际发起的 spawn 尝试次数（0=中止于首发之前） */
+	attempts?: number;
+}
+
 /** loop_task 工具返回结构（stub 阶段即含完整形状，M2+ 填充实质内容） */
 export interface LoopToolResult {
 	/** stub=占位实现；completed=已达成 verified；failed=失败收尾；budget_exhausted=预算耗尽 */
@@ -69,6 +96,8 @@ export interface LoopToolResult {
 	preset: EffortPreset;
 	/** 遥测（真实调度路径按 RunOutcome 填充；stub 为全零） */
 	telemetry: RunTelemetry;
+	/** 计划元信息摘要（真实调度路径必带：designer 生成或降级 builtin；stub 缺省） */
+	plan?: LoopPlanBrief;
 	/** 人类可读结果摘要 */
 	summary?: string;
 	/** 失败原因（status=failed 时给可操作信息，如 pi-subagents 安装引导；中止记 "aborted"） */

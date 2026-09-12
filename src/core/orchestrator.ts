@@ -102,6 +102,25 @@ const STOP_TIMEOUT_MS = 10_000;
 /** abort 竞速哨兵：完成 payload 是对象或 null，Symbol 保证不与之混淆 */
 const ABORTED = Symbol("pi-loop:aborted");
 
+/**
+ * spawn 失败的「超时/无应答」特征判定（M-1，M2 终审收口）：pi-subagents 缺席的
+ * 真实形态是请求无人应答直至客户端超时——SubagentsRpcClient 对此以 code:"timeout"
+ * 抛 RpcError。按结构化判据检测（不引用具体类——本模块按结构类型消费注入的 rpc，
+ * fake 抛的裸 Error 同样适用）：①错误对象携带 code==="timeout"；②错误消息含
+ * 无应答特征（"无 reply"/"超时"）。agent 不存在等真实拒绝两判据皆不沾——返回
+ * false，调用方不附安装引导、原样呈现失败原因（不把「已安装但被拒绝」误归因为
+ * 「未安装」）。
+ */
+function isNoReplyTimeout(error: unknown): boolean {
+	const code =
+		error !== null && typeof error === "object"
+			? (error as { code?: unknown }).code
+			: undefined;
+	if (code === "timeout") return true;
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes("无 reply") || message.includes("超时");
+}
+
 /** signal → 一次性 settle 的"已中止"哨兵 promise（竞速的从方） */
 interface AbortWatch {
 	promise: Promise<typeof ABORTED>;
@@ -396,10 +415,14 @@ export async function executePlan(
 			runId = acceptance.runId;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			// M-1（M2 终审收口）：安装引导仅在超时/无应答特征时附加——pi-subagents 缺席
+			// 的真实形态；agent 不存在等真实拒绝原样报错，不误归因为「请安装」
 			return failEntry(
 				entry,
 				step,
-				`${message}（pi-subagents 不在或不可用——请安装 pi-subagents 扩展后重试）`,
+				isNoReplyTimeout(error)
+					? `${message}（pi-subagents 不在或不可用——请安装 pi-subagents 扩展后重试）`
+					: message,
 			);
 		}
 

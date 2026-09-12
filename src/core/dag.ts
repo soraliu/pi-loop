@@ -14,7 +14,10 @@
 //     只销账一次，重复项不残留入度、不误报环。此为 Controller ruling（M3-T3）：
 //     与 plan-schema 的 I-1 修复语义统一（schema 放行的形状，编译/执行层不得
 //     拒绝）；planner.test.ts 的 M2 保守报环锁定随之反转。
-//   - 分层结果与 M2 过滤式实现逐位一致：层集合相同，层内序保持 steps 声明序。
+//   - 分层结果（M3-T3 review M-1 弱化为如实描述）：层集合与 M2 过滤式实现一致；
+//     层内序为「next 拼接序」——首层按 steps 声明序（filter 保序），后续层按
+//     （前置层序 × 依赖表构建序，两者均源自声明序）逐组合拼接，交叉解锁时可能在
+//     全局声明序之外。不实现稳定排序：层内是并行集合，消费侧不依赖层内次序。
 
 import type { PlanStep } from "../types.ts";
 
@@ -47,8 +50,8 @@ export function topoLayers(steps: PlanStep[]): PlanStep[][] {
 	// 计数式 Kahn 分层（去重计数）：入度按去重后的依赖集合大小计数，前置剥离时
 	// 每个 (前置, 步骤) 组合只销账一次——重复依赖项不残留入度（不误报环）
 	const indegree = new Map<string, number>();
-	// 前置 id → 依赖它的步骤列表（键内已去重；列表按 steps 声明序构造——
-	// 保证层内顺序与 M2 过滤式实现完全一致）
+	// 前置 id → 依赖它的步骤列表（键内已去重；列表按 steps 声明序构造——层内序
+	// 由「前置层序 × 声明序」的拼接决定，不保证全局声明序，见文件头说明）
 	const dependents = new Map<string, PlanStep[]>();
 	for (const step of steps) {
 		const deps = new Set(step.dependsOn); // 重复依赖项去重（"依赖 a"的无害冗余，Controller ruling）

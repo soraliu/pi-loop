@@ -31,12 +31,16 @@ TIMEOUT_S=600
 # 失败文案同步演进：spawn 超时或应答缺席时，entry.error 与工具 error 都携带此文案）
 RPC_ABSENT_RE='pi-subagents 不在或不可用|请安装 pi-subagents|pi install npm:pi-subagents'
 
-# 模型/环境层降级关键词（与 smoke.sh 的环境降级断言同族，补 timeout/超时类）
-DEGRADED_RE='模型|熔断|excluded|rate|ECONN|ENOTFOUND|EAI_AGAIN|credits|billing|quota|insufficient|timeout|timed.out|超时'
+# 模型/环境层降级关键词（M-2 收口）：①词边界——英文 token 只按整词/紧邻非字母
+# 匹配（防 "generate" 之类子串误报）；CJK 词（模型/熔断/超时）无词边界概念，保持
+# 子串匹配；②仅匹配 run.json 的 error/notes 语义字段聚合文本（run_fail_text），
+# 不再全量 grep run.json 全文 / $OUT——任务提示词等自由文本不参与降级判型
+DEGRADED_RE='模型|熔断|超时|(^|[^A-Za-z])(ECONN|ENOTFOUND|EAI_AGAIN|credits|billing|quota|insufficient|excluded|timeout|timed.out)([^A-Za-z]|$)'
 
 # 模型层不可用特异标记（Fix round 2 实测：pi-subagents 在场但 subagent 模型被熔断/
-# 排除时的报错特征）——必须先于 RPC_ABSENT_RE 判型：spawn 失败的 entry.error 由
-# orchestrator 统一追加「pi-subagents 不在或不可用」引导后缀，模型被拒场景同样在场
+# 排除时的报错特征）——必须先于 RPC_ABSENT_RE 判型。M-1（M2 终审收口）后
+# orchestrator 仅在超时/无应答时追加缺席引导后缀，模型被拒属真实拒绝不附后缀
+# ——判定依赖错误文本自身携带的特征词（$OUT 与 run.json 全文各留一路：双保险）
 MODEL_DOWN_RE='No usable subagent models|cached exclusion|skipping model'
 
 # ---------- 降级 1：无 pi 命令（裸机开发环境） ----------
@@ -77,6 +81,29 @@ run_status() {
     try {
       const rec = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
       console.log(typeof rec.status === "string" ? rec.status : "");
+    } catch {
+      console.log("");
+    }
+  ' "$1" 2>/dev/null
+}
+
+# run.json 的降级判型文本（M-2）：只聚合 error/notes 语义字段——run 级 error、
+# 各 iteration 的 error、plan.notes（designer 降级原因也是环境信号）；损坏/缺
+# 文件回空串。DEGRADED_RE 只在该文本上判型（词边界见定义处），不再全量 grep
+run_fail_text() {
+  node -e '
+    try {
+      const rec = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      const parts = [];
+      if (typeof rec.error === "string" && rec.error) parts.push(rec.error);
+      if (Array.isArray(rec.iterations)) {
+        for (const it of rec.iterations) {
+          if (it && typeof it.error === "string" && it.error) parts.push(it.error);
+        }
+      }
+      const notes = rec.plan && typeof rec.plan.notes === "string" ? rec.plan.notes : "";
+      if (notes) parts.push(notes);
+      console.log(parts.join("\n"));
     } catch {
       console.log("");
     }
@@ -158,11 +185,8 @@ if [ -z "$RUN_JSON" ]; then
     tail -5 "$OUT"
     exit 0
   fi
-  if grep -qE "$DEGRADED_RE" "$OUT"; then
-    echo "SKIP: model/runtime degraded（熔断/额度/网络类失败，loop_task 未被执行）"
-    tail -5 "$OUT"
-    exit 0
-  fi
+  # 模型/环境层降级关键词仅匹配 run.json 的 error/notes 字段（M-2）——无 run.json
+  # 落盘时无从聚合；宽匹配（grep $OUT）会误容真实失败，故此处只保留特异标记判型
   echo "FAIL: 无 run.json 落盘（模型未调用 loop_task 且无环境降级特征）"
   echo "--- pi output (tail 50) ---"
   tail -50 "$OUT"
@@ -200,8 +224,8 @@ if [ "$VERDICT" = "PASS" ]; then
 fi
 
 # ---------- 降级 3：模型层不可用（pi-subagents 在场但子代理模型被拒） ----------
-# 顺序注意：spawn 失败的 entry.error 由 orchestrator 统一追加「pi-subagents 不在或
-# 不可用」引导后缀——先用更特异的模型层特征判型，避免误归因为包缺席
+# 顺序注意（M-1 后）：模型被拒属真实拒绝，不附缺席引导后缀——错误文本自身
+# 携带特征词；先用更特异的模型层特征判型，避免误归因为包缺席
 if grep -qE "$MODEL_DOWN_RE" "$RUN_JSON" "$OUT" 2>/dev/null; then
   echo "SKIP: 模型层不可用（熔断/额度/供应商不稳）"
   tail -5 "$OUT"
@@ -215,12 +239,14 @@ if grep -qE "$RPC_ABSENT_RE" "$RUN_JSON" "$OUT" 2>/dev/null; then
   exit 0
 fi
 
-# ---------- 降级 5：总控超时与泛化降级 ----------
+# ---------- 降级 5：总控超时（未到任何终态的最坏情形） ----------
 if [ "$TIMED_OUT" = "1" ]; then
   echo "SKIP: 总控超时（${TIMEOUT_S}s 内真实 subagent 未完成——视为环境受限）"
   exit 0
 fi
-if grep -qE "$DEGRADED_RE" "$RUN_JSON" "$OUT" 2>/dev/null; then
+# ---------- 降级 6：泛化降级（仅 run.json error/notes 语义字段上判型，M-2） ----------
+FAIL_TEXT="$(run_fail_text "$RUN_JSON")"
+if [ -n "$FAIL_TEXT" ] && grep -qE "$DEGRADED_RE" <<<"$FAIL_TEXT"; then
   echo "SKIP: model/runtime degraded（熔断/额度/超时类失败，run 以 failed 收尾）"
   tail -5 "$OUT"
   exit 0

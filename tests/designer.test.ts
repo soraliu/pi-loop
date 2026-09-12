@@ -140,6 +140,7 @@ interface FakeOutcome {
  */
 class FakeRpc {
 	readonly spawns: Array<{
+		workflowScript?: string;
 		agent?: string;
 		task?: string;
 		context?: string;
@@ -168,13 +169,10 @@ class FakeRpc {
 		context?: string;
 	}): Promise<{ runId: string }> {
 		const runId = `d-${++this.nextRunId}`;
-		// 先记账再可能抛出：受理被拒也计入 spawn 尝试台账
-		this.spawns.push({
-			agent: params.agent,
-			task: params.task,
-			context: params.context,
-			runId,
-		});
+		// 先记账再可能抛出：受理被拒也计入 spawn 尝试台账。全量展开 params——
+		// 「"model" in spawn」断言由此从恒真变为有效锁定（M3-T4 顺手：designer 契约
+		// 是不指定 model，展开后若实现真传了 model，断言立即红）
+		this.spawns.push({ ...params, runId });
 		const outcome = this.outcomes[this.nextRunId - 1] ?? {};
 		if (outcome.completionTimeout) this.timeoutRunIds.add(runId);
 		if (outcome.spawnError) throw outcome.spawnError;
