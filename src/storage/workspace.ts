@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { EffortLevel, RunSummary } from "../types.ts";
+import type { EffortLevel, IterationEntry, RunSummary } from "../types.ts";
 
 /** 生产环境默认数据根目录（~/.pi/loop/） */
 export function defaultDataDir(): string {
@@ -18,8 +18,8 @@ export function defaultDataDir(): string {
 export interface RunRecord extends RunSummary {
 	/** 任务全文（不截断；taskPreview 是其截断视图） */
 	task: string;
-	/** 迭代轮次记录（M2+ 由 Orchestrator 填充） */
-	iterations: unknown[];
+	/** 迭代记录（Orchestrator 按计划步骤追加；M1 阶段恒为空数组） */
+	iterations: IterationEntry[];
 }
 
 /** run id：`r-<epoch36>` 加短随机后缀，防同毫秒碰撞且按创建时间天然有序 */

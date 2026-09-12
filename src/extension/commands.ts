@@ -1,12 +1,18 @@
 // pi-loop 命令注册（M1-T4）：/loop、/loop-status、/loop-cases、/loop-methods
-// 契约：docs/SPEC.md §6（命令交互面）、docs/plans/m1-skeleton.md Task 4。
-// /loop 与 loop_task 工具共享 runLoopTaskStub 核心（单一事实源）。
+// 契约：docs/SPEC.md §6（命令交互面）、docs/plans/m1-skeleton.md Task 4、m2-orchestrator.md Task 4。
+// /loop 与 loop_task 工具共享 runLoopTask 核心（单一事实源）；M2-T4 起经 fake/真实
+// 总线走真实调度，进度以 ctx.ui.notify 投递（每步一条：按 stepId 节流去重）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import type { PlanUpdate } from "../core/orchestrator.ts";
 import type { CommandContext, PiExtensionApi } from "./api.ts";
-import { resolveDataDir, runLoopTaskStub } from "./loop-task.ts";
+import {
+  describeStepUpdate,
+  resolveDataDir,
+  runLoopTask,
+} from "./loop-task.ts";
 import { isEffortLevel } from "../storage/settings.ts";
 import type { EffortLevel, LoopToolParams, RunSummary } from "../types.ts";
 
@@ -110,7 +116,8 @@ export function listRecentRuns(dataDir: string): RunSummary[] {
         createdAt?: string;
       };
       // 字段级损坏与 JSON 级损坏同语义：跳过该记录，不用 "unknown" 占位伪装
-      if (record.status === undefined || !isEffortLevel(record.effort)) continue;
+      if (record.status === undefined || !isEffortLevel(record.effort))
+        continue;
       out.push({
         id: record.id ?? entry,
         status: record.status as RunSummary["status"],
@@ -133,12 +140,31 @@ function countFiles(dir: string): number {
     .filter((name) => fs.statSync(path.join(dir, name)).isFile()).length;
 }
 
+/**
+ * /loop 的进度节流器（task brief：命令侧 notify 每步一条）。
+ * onUpdate 对同一步会先 running 后终态，直接逐条转发会每步多发——按 stepId
+ * 计数去重，只投递首条；迟到的重复更新静默吞掉，终态汇总由 handler 的完成摘要兜底。
+ */
+export function makeStepNotifier(
+  notify: (message: string, level?: "info" | "warning" | "error") => void,
+): (update: PlanUpdate) => void {
+  const seen = new Set<string>();
+  return (update) => {
+    if (seen.has(update.stepId)) return;
+    seen.add(update.stepId);
+    notify(
+      describeStepUpdate(update),
+      update.status === "failed" ? "error" : "info",
+    );
+  };
+}
+
 /** 注册全部 /loop* 命令 */
 export function registerLoopCommands(pi: PiExtensionApi): void {
   pi.registerCommand("loop", {
     description:
       '启动一次 loop 任务（用法: /loop <任务> [--effort low|medium|high|max] [--verify "命令"] [--context 路径]）',
-    handler: (args: string, ctx: CommandContext) => {
+    handler: async (args: string, ctx: CommandContext) => {
       const parsed = parseLoopArgs(args);
       if (parsed.error !== undefined) {
         ctx.ui.notify(`参数错误: ${parsed.error}`, "error");
@@ -154,11 +180,25 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
           ? {}
           : { contextPaths: parsed.contextPaths }),
       };
+      // 进度：每步一条 notify（stepId 去重节流）；完成后另发一条摘要（其余命令均只在完成时 notify 一条）
+      const notifyStep = makeStepNotifier(ctx.ui.notify);
       try {
-        const result = runLoopTaskStub(params);
+        const result = await runLoopTask(params, {
+          busEnv: pi.events,
+          onUpdate: notifyStep,
+        });
+        if (result.status === "stub") {
+          // M1 stub 语义（PI_LOOP_STUB=1）：原有单条通知文案保持不变
+          ctx.ui.notify(
+            `已创建运行 ${result.runId}（effort=${result.effort}，迭代上限=${result.preset.maxResultIterations}，并行上限=${result.preset.maxParallelSubagents}）。stub：调度引擎在 M2 接入。`,
+            "info",
+          );
+          return;
+        }
+        const tail = result.error === undefined ? "" : `\n${result.error}`;
         ctx.ui.notify(
-          `已创建运行 ${result.runId}（effort=${result.effort}，迭代上限=${result.preset.maxResultIterations}，并行上限=${result.preset.maxParallelSubagents}）。stub：调度引擎在 M2 接入。`,
-          "info",
+          `${result.summary}（run ${result.runId}）${tail}`,
+          result.status === "completed" ? "info" : "error",
         );
       } catch (error) {
         ctx.ui.notify(
