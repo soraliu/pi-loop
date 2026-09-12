@@ -65,8 +65,8 @@ async function executeLoopTask(
   const params = rawParams as SchemaParams;
   const loopParams: LoopToolParams = {
     task: params.task,
-    // effort 窄化为合法档位：undefined 直接省略；非 undefined 的非法值
-    // 由 isEffortLevel 守卫拦截（runLoopTaskStub 内 resolveEffort 抛 TypeError）
+    // effort 窄化为合法档位：undefined 直接省略（缺省回落由 runLoopTaskStub 处理）；
+    // 非 undefined 的非法值由 runLoopTaskStub 内 isEffortLevel 守卫拦截并抛 TypeError
     ...(params.effort === undefined
       ? {}
       : { effort: params.effort as LoopToolParams["effort"] }),
