@@ -484,6 +484,34 @@ describe("generatePlan — rpc 层失败（不重试立即降级）", () => {
 		expect(fake.spawns).toHaveLength(1);
 	});
 
+	it("spawn 受理被拒（真实拒绝，非超时特征）→ 降级 notes 原样报错、不误附安装引导（M-2）", async () => {
+		const { dataDir, runId } = setupRun();
+		// agent 不存在的真实拒绝：既无 code==="timeout"，消息也不含超时/无应答特征
+		// ——isNoReplyTimeout 判否，notes 不附安装引导（误导会把真实失败误归因为
+		// 包缺席，污染 smoke-e2e 的 RPC_ABSENT_RE 判型）
+		const rejection = new Error('RPC spawn 失败: agent "researcher" 不存在');
+		(rejection as Error & { code?: string }).code = "agent_not_found";
+		const fake = new FakeRpc().script({ spawnError: rejection });
+		const outcome = await generatePlan(TASK, PRESET, {
+			rpc: fake,
+			runId,
+			dataDir,
+		});
+
+		expect(outcome).toMatchObject({
+			attempts: 1,
+			degraded: true,
+			channel: "builtin",
+		});
+		// 原样报错：降级原因如实携带拒绝原文
+		expect(outcome.plan.notes).toContain("designer 降级：Designer spawn 失败");
+		expect(outcome.plan.notes).toContain('"researcher" 不存在');
+		// 不误归因：真实拒绝不带"未安装"引导
+		expect(outcome.plan.notes).not.toContain("请安装 pi-subagents");
+		expect(outcome.plan.notes).not.toContain("不在或不可用");
+		expect(fake.spawns).toHaveLength(1);
+	});
+
 	it("完成等待超时（waitForCompletion 回 null）→ 立即降级：attempts=1、超时原因入 notes", async () => {
 		const { dataDir, runId } = setupRun();
 		const fake = new FakeRpc().script({ completionTimeout: true });

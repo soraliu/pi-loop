@@ -3,7 +3,7 @@
 // fake pi 对象只捕获注册的 definition/handler，直接调用以覆盖 execute 逻辑；
 // 真实路径的 fake RPC 总线（受理/完成/缺席三态）经 fake pi 的 events 注入。
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,6 +28,31 @@ import {
   runLoopTaskStub,
 } from "../src/extension/loop-task.ts";
 import type { LoopToolResult } from "../src/types.ts";
+
+// ---------- executePlan 的 budget 注入捕获（M3-T5：M-1 收口） ----------
+// vi.mock 对整个文件生效：wrapper 透传实际实现（既有用例零影响），只旁路记录
+// runLoopTask → executePlan 的 ctx.budget——T4 报告申报的捕获型断言在此兑现。
+// vi.mock 工厂会被提升到文件顶部，引用的变量必须经 vi.hoisted 同样提升
+const budgetCaptures = vi.hoisted(
+  () =>
+    [] as Array<
+      { maxPlanSteps: number; maxParallelSubagents: number } | undefined
+    >,
+);
+vi.mock("../src/core/orchestrator.ts", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/core/orchestrator.ts")>();
+  return {
+    ...actual,
+    executePlan: (
+      plan: Parameters<typeof actual.executePlan>[0],
+      ctx: Parameters<typeof actual.executePlan>[1],
+    ) => {
+      budgetCaptures.push(ctx.budget);
+      return actual.executePlan(plan, ctx);
+    },
+  };
+});
 
 // ---------- 临时目录纪律（登记制清理，仅清理本文件创建的目录） ----------
 const tempDirs: string[] = [];
@@ -139,7 +164,12 @@ interface HostUpdate {
  * mode="silent"：收到请求不应答（pi-subagents 缺席——只能靠客户端超时兜底）。
  */
 function makeFakeSubagentsBus(
-  opts: { mode?: "respond" | "silent" } = {},
+  opts: {
+    mode?: "respond" | "silent";
+    /** 完成事件投递前按 spawn 的任务文本同步回调（M3-T5：designer 成功通道——模拟
+     * designer agent 先写 designer-plan.json 再完成，与真实时序同构） */
+    preComplete?: (task: string) => void;
+  } = {},
 ): SubagentEventBus {
   const listeners = new Map<string, Set<(payload: unknown) => unknown>>();
   let counter = 0;
@@ -151,7 +181,10 @@ function makeFakeSubagentsBus(
       if (event !== "subagents:rpc:v1:request" || opts.mode === "silent") {
         return undefined;
       }
-      const req = payload as { requestId: string };
+      const req = payload as {
+        requestId: string;
+        params?: { task?: string };
+      };
       const runId = `fake-run-${++counter}`;
       // 受理应答：微任务（in-process 即时应答）
       queueMicrotask(() =>
@@ -162,16 +195,16 @@ function makeFakeSubagentsBus(
         }),
       );
       // 完成事件：延迟宏任务（晚于 waitForCompletion 的订阅）
-      setTimeout(
-        () =>
-          deliver("subagent:async-complete", {
-            runId,
-            status: "succeeded",
-            summary: "研究结论：tokio 采用 work-stealing 调度",
-            output: "/runs/fake/research-transcript.md",
-          }),
-        FAKE_COMPLETE_DELAY_MS,
-      );
+      setTimeout(() => {
+        // preComplete 先于完成事件同步执行——产物文件对 extractPlan 先可见
+        opts.preComplete?.(req.params?.task ?? "");
+        deliver("subagent:async-complete", {
+          runId,
+          status: "succeeded",
+          summary: "研究结论：tokio 采用 work-stealing 调度",
+          output: "/runs/fake/research-transcript.md",
+        });
+      }, FAKE_COMPLETE_DELAY_MS);
       return undefined;
     },
     on: (event: string, handler: (payload: unknown) => unknown) => {
@@ -817,5 +850,118 @@ describe("/loop 命令 — 真实调度与进度节流", () => {
     expect(messages[3].text).toContain("critic");
     expect(messages[3].text).toContain("执行失败");
     expect(messages[3].level).toBe("error");
+  });
+});
+
+// ---------- M3-T5：designer 成功通道全链 + budget 注入捕获（I-2 / M-1 遗留收口） ----------
+describe("runLoopTask — designer 成功通道（M3-T5）", () => {
+  it("designer 写出 designer-plan.json（fake 总线 preComplete）→ 全链 origin=designer 两步执行 + executePlan 收到 preset 派生的 budget", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      // 两步计划（survey → synth 依赖链）：产物步数与 RunRecord.plan.steps 的对账
+      // 来源——I-2 断言「plan.steps === 文件中的步数」
+      const designerPlan = {
+        version: 1,
+        task: "研究 scheduler 设计空间并给出结论",
+        origin: "designer" as const,
+        notes: "两步走：先摸底再综合",
+        steps: [
+          {
+            id: "survey",
+            agent: "researcher",
+            task: "摸底主流并发 scheduler 的设计模型",
+            dependsOn: [],
+          },
+          {
+            id: "synth",
+            agent: "researcher",
+            task: "综合上下游结论并给出最终对比",
+            dependsOn: ["survey"],
+          },
+        ],
+      };
+      let designerTaskText = "";
+      const bus = makeFakeSubagentsBus({
+        preComplete: (task) => {
+          // 只有 designer 的 spawn 任务含输出契约行（内嵌产物绝对路径——run id 运行时
+          // 才产生，从任务文本提取）；步骤 spawn 的任务文本不含该行，回调空转
+          const match = /把最终 ResearchPlan 的完整 JSON 写入文件：(\S+)/.exec(
+            task,
+          );
+          if (!match) return;
+          designerTaskText = task;
+          const planFile = match[1];
+          fs.mkdirSync(path.dirname(planFile), { recursive: true });
+          fs.writeFileSync(planFile, JSON.stringify(designerPlan));
+        },
+      });
+      const capturesBefore = budgetCaptures.length;
+      const result = await runLoopTask(
+        { task: "研究 scheduler 设计空间并给出结论" },
+        { busEnv: bus },
+      );
+      // 全链返回：completed + LoopToolResult.plan 的 designer 摘要（未降级）
+      expect(result.status).toBe("completed");
+      expect(result.error).toBeUndefined();
+      expect(result.telemetry).toMatchObject({
+        steps: 2,
+        succeeded: 2,
+        failed: 0,
+        iterations: 2,
+      });
+      expect(result.plan).toEqual({
+        origin: "designer",
+        steps: 2,
+        degraded: false,
+      });
+      // run.json：plan 全量元信息（attempts=1 一次即成 / channel=file 文件通道）
+      // + 逐步骤 entry 终态与计划步数一致
+      const record = JSON.parse(
+        fs.readFileSync(
+          path.join(tmp, "runs", result.runId, "run.json"),
+          "utf-8",
+        ),
+      ) as {
+        status: string;
+        plan?: {
+          origin: string;
+          steps: number;
+          degraded: boolean;
+          channel?: string;
+          attempts?: number;
+        };
+        iterations: Array<{ stepId: string; status: string }>;
+      };
+      expect(record.status).toBe("completed");
+      expect(record.plan).toMatchObject({
+        origin: "designer",
+        steps: 2,
+        degraded: false,
+        channel: "file",
+        attempts: 1,
+      });
+      expect(record.iterations.map((e) => `${e.stepId}:${e.status}`)).toEqual([
+        "survey:succeeded",
+        "synth:succeeded",
+      ]);
+      // I-2 的对账点：RunRecord.plan.steps === 产物文件中的步数
+      const planFileText = fs.readFileSync(
+        path.join(tmp, "runs", result.runId, "designer-plan.json"),
+        "utf-8",
+      );
+      expect(JSON.parse(planFileText).steps).toHaveLength(2);
+      // M-1：executePlan 侧捕获的 budget 与生效 preset 原样一致（medium：5/4）
+      expect(budgetCaptures).toHaveLength(capturesBefore + 1);
+      expect(budgetCaptures[capturesBefore]).toEqual({
+        maxPlanSteps: 5,
+        maxParallelSubagents: 4,
+      });
+      // 附带锁定注入链头端：preset → designer 任务文本的预算约束行
+      expect(designerTaskText).toContain("计划步骤数上限：5 步");
+      expect(designerTaskText).toContain("最多 4 个 subagent");
+    } finally {
+      restoreEnv(saved);
+    }
   });
 });

@@ -4,8 +4,14 @@
 //   请求   emit("subagents:rpc:v1:request", { version: 1, requestId, method, params })
 //   回复   on("subagents:rpc:v1:reply:<requestId>") → { version, requestId, success, data | error }
 //   就绪   on("subagents:rpc:v1:ready")（在场信号；不作为请求前置条件）
-//   完成   on("subagent:async-complete")——spawn 的 reply 只是"已受理"（含 runId），
-//          真正完成经此事件通知；payload 结构未完全文档化，做防御性 runId 匹配。
+//   完成   on("subagent:async-complete")——spawn 的 reply 只是"已受理"，受理形态
+//          （pi-subagents src/runs/background/async-execution.ts:2091 + extension/rpc.ts
+//          dataFromToolResult，M3-T5 Fix round 2 e2e 实跑校准）为
+//          { text: "Async: <agent> [<runId>]…(受理 guidance)",
+//            details: { mode: "single", runId, asyncId, results: [], … } }
+//          ——顶层无 runId，藏在 details（text 首行受理头另有副本）——spawn() 内
+//          做归一化（见 normalizeSpawnAcceptance）；真正完成经此事件通知，
+//          payload 结构未完全文档化，做防御性 runId 匹配。
 // 设计约束：一次请求一次 reply；不重试、不自动重连；pi-subagents 不在场时由超时兜底。
 
 import { randomUUID } from "node:crypto";
@@ -46,7 +52,9 @@ export class RpcError extends Error {
 	}
 }
 
-/** spawn 受理结果（async-only：reply 即受理，完成需等 subagent:async-complete） */
+/** spawn 受理结果（async-only：reply 即受理，完成需等 subagent:async-complete）。
+ * runId 经 spawn() 的归一化通道提取（M3-T5 Fix round 2）：顶层 / details.runId /
+ * details.asyncId / text 受理头四通道；消费方只需读顶层 runId。 */
 export interface SpawnAcceptance {
 	runId?: string;
 	[key: string]: unknown;
@@ -64,6 +72,43 @@ function extractRunId(payload: unknown): string | undefined {
 		if (typeof nestedId === "string") return nestedId;
 	}
 	return undefined;
+}
+
+/** 受理头 runId 提取正则（宿主受理 text 首行："Async: <agent> [<runId>]"） */
+const ASYNC_HEADER_RUN_ID_RE = /Async: \S+ \[([^\]]+)\]/;
+
+/** 非空字符串判定（受理 runId 候选的统一形状校验） */
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * spawn 受理 data 的归一化（M3-T5 Fix round 2，e2e 实跑校准）：宿主真实受理形态的
+ * runId 不在顶层（藏在 details，text 首行受理头另有副本）——若不提取，多步计划的
+ * orchestrator 防线（“spawn 受理未返回 runId：多步计划下无法区分各步的完成事件”）
+ * 会拒绝一切多步执行。M2 未暴露：单步计划缺省 runId 可退化为“等任意完成事件”。
+ * runId 提取的优先级（双通道防御，与 readCompletion 的 outputRef 宽候选集同风格）：
+ *   ① 顶层 runId（M2 造形与既有 fake 的向后兼容——在场即权威）；
+ *   ② details.runId / details.asyncId（宿主真实形态，async-execution.ts:2091）；
+ *   ③ text 首行受理头正则（details 变形/缺失时的兜底）。
+ * 其余字段（text/details 等）原样透传在返回对象上（消费者可能用）；返回浅拷贝，
+ * 不 mutate reply data。
+ */
+function normalizeSpawnAcceptance(data: unknown): SpawnAcceptance {
+	if (data === null || typeof data !== "object") return {};
+	const raw = data as SpawnAcceptance & { text?: unknown; details?: unknown };
+	if (isNonEmptyString(raw.runId)) return { ...raw };
+	if (raw.details !== null && typeof raw.details === "object") {
+		const details = raw.details as Record<string, unknown>;
+		if (isNonEmptyString(details.runId)) return { ...raw, runId: details.runId };
+		if (isNonEmptyString(details.asyncId))
+			return { ...raw, runId: details.asyncId };
+	}
+	if (typeof raw.text === "string") {
+		const match = ASYNC_HEADER_RUN_ID_RE.exec(raw.text);
+		if (match !== null) return { ...raw, runId: match[1] };
+	}
+	return { ...raw };
 }
 
 export interface SubagentsRpcClientOptions {
@@ -183,8 +228,9 @@ export class SubagentsRpcClient {
 	}
 
 	/**
-	 * spawn 一个 async run。注意返回值是"受理信息"（可能含 runId），
-	 * 完成需另行 waitForCompletion。
+	 * spawn 一个 async run。注意返回值是"受理信息"（归一化后顶层 runId 已提取——
+	 * M3-T5 Fix round 2：宿主受理形态的 runId 藏 details/text 受理头，见
+	 * normalizeSpawnAcceptance），完成需另行 waitForCompletion。
 	 */
 	spawn(
 		params: {
@@ -195,11 +241,9 @@ export class SubagentsRpcClient {
 		},
 		timeoutMs?: number,
 	): Promise<SpawnAcceptance> {
-		return this.request(
-			"spawn",
-			{ context: "fresh", ...params },
-			timeoutMs,
-		) as Promise<SpawnAcceptance>;
+		return this.request("spawn", { context: "fresh", ...params }, timeoutMs).then(
+			(data) => normalizeSpawnAcceptance(data),
+		);
 	}
 
 	/** 停止一个 async run */

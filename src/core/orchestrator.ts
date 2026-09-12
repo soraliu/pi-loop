@@ -110,8 +110,11 @@ const ABORTED = Symbol("pi-loop:aborted");
  * 无应答特征（"无 reply"/"超时"）。agent 不存在等真实拒绝两判据皆不沾——返回
  * false，调用方不附安装引导、原样呈现失败原因（不把「已安装但被拒绝」误归因为
  * 「未安装」）。
+ *
+ * M3-T5 起导出供 designer.ts 的 spawn 失败分支复用（M3-T4 review M-2 收口：
+ * designer 降级 notes 的安装引导与 orchestrator 的 M-1 采用同款门控，单一真源）。
  */
-function isNoReplyTimeout(error: unknown): boolean {
+export function isNoReplyTimeout(error: unknown): boolean {
 	const code =
 		error !== null && typeof error === "object"
 			? (error as { code?: unknown }).code

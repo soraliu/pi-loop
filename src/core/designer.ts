@@ -14,13 +14,15 @@
 //   ⑥ 降级 = BUILTIN_PLAN + notes 如实记原因（诚实遥测：降级禁止冒充正常生成）
 //
 // 口径复用声明（本地固化而非 import 的项）：orchestrator.ts 的
-// STEP_COMPLETION_TIMEOUT_MS / STOP_TIMEOUT_MS / createAbortWatch 是模块私有，且该文件
-// 由并行任务（M3-T3）维护——本模块按同口径本地实现（10 分钟 / 10 秒 / 同款 abort 竞速），
-// 漂移由测试的 timeoutMs 断言锁定。
+// STEP_COMPLETION_TIMEOUT_MS / STOP_TIMEOUT_MS / createAbortWatch 在本项目并行期由
+// M3-T3 任务维护故本地同口径实现（10 分钟 / 10 秒 / 同款 abort 竞速），漂移由测试的
+// timeoutMs 断言锁定；M3-T5 起唯一例外：isNoReplyTimeout 特征判别（已导出）经 import
+// 复用——spawn 失败的安装引导门控与 orchestrator 的 M-1 单一真源（M3-T4 review M-2）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { isNoReplyTimeout } from "./orchestrator.ts";
 import { validateResearchPlan } from "./plan-schema.ts";
 import { BUILTIN_PLAN } from "./planner-static.ts";
 import type { SubagentsRpcClient } from "./rpc.ts";
@@ -367,10 +369,17 @@ export async function generatePlan(
 				});
 				runId = acceptance.runId;
 			} catch (error) {
-				// rpc 层失败（受理拒绝/超时）：不重试直接降级（与"校验重试"区分）
+				// rpc 层失败（受理拒绝/超时）：不重试直接降级（与"校验重试"区分）。
+				// M-2 收口（M3-T4 review）：安装引导仅在超时/无应答特征时附加
+				// （isNoReplyTimeout——与 orchestrator 的 M-1 同款判别，import 复用）；
+				// agent 不存在等真实拒绝原样入 notes，不误报"未安装"——smoke-e2e 的
+				// RPC_ABSENT_RE 据此判型，误附会把真实失败误归因为包缺席
+				const reason = `Designer spawn 失败：${errorMessage(error)}`;
 				return degrade(
 					attempt,
-					`Designer spawn 失败：${errorMessage(error)}（pi-subagents 不在或不可用——请安装 pi-subagents 扩展后重试）`,
+					isNoReplyTimeout(error)
+						? `${reason}（pi-subagents 不在或不可用——请安装 pi-subagents 扩展后重试）`
+						: reason,
 				);
 			}
 			// 受理缺省 runId 时等任意完成事件：designer 在途 run 至多一个，事件可归属

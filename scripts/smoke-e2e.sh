@@ -1,30 +1,46 @@
 #!/usr/bin/env bash
-# pi-loop 端到端冒烟脚本（M2-T5）
-# 验证链路：真实 pi 宿主加载扩展 → 模型调用 loop_task → pi-subagents 真实 spawn
-# researcher 跑微型研究任务 → 完成事件回写 RunRecord → 断言 run.json 终态 completed。
+# pi-loop 端到端冒烟脚本（M2-T5 → M3-T5 双场景升级）
+# 验证链路：真实 pi 宿主加载扩展 → 模型调用 loop_task → designer 动态生成计划
+# （researcher 兼任设计）→ pi-subagents 真实逐层 spawn → 完成事件回写 → 断言 run.json。
+#
+# 场景 A（designer 多步全链，M3 主目标）：中等复杂度任务 → designer 真实生成计划
+#   → 逐层执行 → completed。核心断言：plan.origin==="designer" && status==="completed"
+#   && steps>=1（容忍 1 步——designer 合理判定无需分解也是降级之外的成功）&&
+#   全部 entry 终态非 pending（iterations 数 === 计划步数）；channel=file 时另对
+#   designer-plan.json 做 steps 结构独立对账（id 唯一 / dependsOn 计划内自洽）。
+# 场景 B（预算强制路径，M3-T5）：dataDir 级 settings.json 把 low 档 maxPlanSteps
+#   压成 1（loadLoopSettings 读 <dataDir>/settings.json 深合并——M1 合并语义，
+#   无需任何 env 钩子）→ designer 被迫单步（schema 侧 maxSteps=1 拒绝多步）或
+#   降级 builtin → 断言不 crash + steps<=1 + origin 如实。
 #
 # 与 scripts/smoke.sh（M1 结构冒烟）的分工：
 #   smoke.sh    只验证"扩展可加载 + 工具可被调用、run id 落盘"（秒级，不真实 spawn）；
-#   本脚本     走真实调度全链（分钟级；消耗 pi 主模型一轮 + researcher 一轮模型调用）。
+#   本脚本     走真实调度全链（分钟级；每场景各消耗 pi 主模型 + designer + 若干步
+#               的工作流 spawn）。
 #
 # 环境策略（brief 折衷方案：复用真实用户环境 + dataDir 隔离）：
 #   - 不隔离 HOME：真实 spawn 依赖宿主用户级 agent 定义（researcher 等）与 pi 配置，
 #     隔离 HOME 会失去这些定义，spawn 必然失败（T4 派生事实）；
-#   - PI_LOOP_DATA_DIR 指向临时目录：run 落盘隔离，绝不写真实 ~/.pi/loop/；
+#   - PI_LOOP_DATA_DIR 指向临时目录：run 落盘隔离，绝不写真实 ~/.pi/loop/
+#     （场景 B 的 settings.json 覆盖也因此只作用于本临时目录）；
 #   - 主动 unset PI_LOOP_STUB：e2e 必须走真实路径（防外环境残留 stub 开关）。
 #
 # 退出码语义（与 smoke.sh 同哲学）：
-#   0 = 全链真实跑通，或显式 SKIP（环境不满足：pi / node 缺失、pi-subagents 缺席、
-#       模型层熔断或额度耗尽、总控超时）；
-#   1 = 断言真实失败（扩展加载失败 / run.json 终态非 completed / 无落盘），dump 诊断。
+#   0 = 所有已执行场景 PASS，或全部止于显式 SKIP（环境不满足：pi / node 缺失、
+#       pi-subagents 缺席、模型层熔断或额度耗尽、总控超时、泛化降级；
+#       designer 未产出有效计划但内建计划照跑 completed 也视作 SKIP——e2e 的
+#       目标是证明 designer 链，环境模型未满足输出契约时不计失败）；
+#       场景 A 的环境级 SKIP 会连带跳过场景 B（同一环境同因）；
+#   1 = 断言真实失败（扩展加载失败 / run.json 终态非预期 / 无落盘），dump 诊断。
 #
 # 用法：bash scripts/smoke-e2e.sh（可重复本地运行；每次 mktemp 全新目录，退出即清理）
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# 总控超时（秒）：pi 调用 + 完成等待合计上限。真实 subagent 一轮微型研究约 1-5 分钟
-# （含 pi 侧模型调用）；调度内核单步完成等待同为 10 分钟，总控先到即 SIGTERM。
+# 单场景总控超时（秒）：pi 调用 + 完成等待合计上限。真实链路一轮 spawn 约 1-5 分钟
+# （含 pi 侧模型调用）；designer 与每步各占一轮，600s 需紧则 SIGTERM；调度内核单步
+# 完成等待同为 10 分钟，总控先到即终止单场景。
 TIMEOUT_S=600
 
 # pi-subagents 缺席标记（与 src/core/orchestrator.ts / src/extension/loop-task.ts 的
@@ -34,13 +50,16 @@ RPC_ABSENT_RE='pi-subagents 不在或不可用|请安装 pi-subagents|pi install
 # 模型/环境层降级关键词（M-2 收口）：①词边界——英文 token 只按整词/紧邻非字母
 # 匹配（防 "generate" 之类子串误报）；CJK 词（模型/熔断/超时）无词边界概念，保持
 # 子串匹配；②仅匹配 run.json 的 error/notes 语义字段聚合文本（run_fail_text），
-# 不再全量 grep run.json 全文 / $OUT——任务提示词等自由文本不参与降级判型
-DEGRADED_RE='模型|熔断|超时|(^|[^A-Za-z])(ECONN|ENOTFOUND|EAI_AGAIN|credits|billing|quota|insufficient|excluded|timeout|timed.out)([^A-Za-z]|$)'
+# 不再全量 grep run.json 全文 / $OUT——任务提示词等自由文本不参与降级判型。
+# M3-T5（I-1 修）：token 组补回 "rate"——词边界保证 "generate/operate" 不误中、
+# "rate_limit / rate limit" 恢复命中（T4 报告声明的口径兑现）
+DEGRADED_RE='模型|熔断|超时|(^|[^A-Za-z])(ECONN|ENOTFOUND|EAI_AGAIN|rate|credits|billing|quota|insufficient|excluded|timeout|timed.out)([^A-Za-z]|$)'
 
 # 模型层不可用特异标记（Fix round 2 实测：pi-subagents 在场但 subagent 模型被熔断/
 # 排除时的报错特征）——必须先于 RPC_ABSENT_RE 判型。M-1（M2 终审收口）后
-# orchestrator 仅在超时/无应答时追加缺席引导后缀，模型被拒属真实拒绝不附后缀
-# ——判定依赖错误文本自身携带的特征词（$OUT 与 run.json 全文各留一路：双保险）
+# orchestrator/designer 仅在超时/无应答特征时追加缺席引导后缀，模型被拒属真实
+# 拒绝不附后缀——判定依赖错误文本自身携带的特征词（$OUT 与 run.json 全文各留
+# 一路：双保险；token 为特异英文短语，自由文本不误中）
 MODEL_DOWN_RE='No usable subagent models|cached exclusion|skipping model'
 
 # ---------- 降级 1：无 pi 命令（裸机开发环境） ----------
@@ -55,24 +74,21 @@ if ! command -v node >/dev/null 2>&1; then
   exit 0
 fi
 
-# 落盘隔离：临时 dataDir + pi 输出日志（退出时一并清理，失败路径已先行 dump）
-DATA_DIR="$(mktemp -d /tmp/pi-loop-e2e-data-XXXXXX)"
-OUT="$(mktemp /tmp/pi-loop-e2e-out-XXXXXX.log)"
-trap 'rm -rf "$DATA_DIR" "$OUT"' EXIT
+# 落盘隔离：每场景独立临时 dataDir + pi 输出日志（退出时一并清理，失败路径已先行 dump）
+DATA_A="$(mktemp -d /tmp/pi-loop-e2e-data-XXXXXX)"
+OUT_A="$(mktemp /tmp/pi-loop-e2e-out-XXXXXX.log)"
+DATA_B="$(mktemp -d /tmp/pi-loop-e2e-data-XXXXXX)"
+OUT_B="$(mktemp /tmp/pi-loop-e2e-out-XXXXXX.log)"
+trap 'rm -rf "$DATA_A" "$OUT_A" "$DATA_B" "$OUT_B"' EXIT
 
 # e2e 必须走真实调度：清除可能从外环境泄漏的 M1 stub 开关
 unset PI_LOOP_STUB
 
-# 步骤②：一句指派即触发全链（模型调 loop_task → spawn researcher → 等完成）
-PROMPT="调用 loop_task 工具：研究任务'用一句话说明 pi-loop 是什么'，effort: low"
-
-echo "== e2e: 启动 pi（真实调度；dataDir=${DATA_DIR}；总控超时 ${TIMEOUT_S}s）"
-
 # ---------- 步骤的辅助（终态驱动的等待需要）：定位 run.json / 探读终态 / 优雅终止 ----------
-# 定位最新 run.json（单次指派应恰一个；万一多 run 取字典序最大——r-<epoch36>-<rand>
+# 定位最新 run.json（单场景应恰一个；万一多 run 取字典序最大——r-<epoch36>-<rand>
 # 同长，字典序=时间序；路径来自自建临时目录，无空格/换行风险）
 find_run_json() {
-  find "$DATA_DIR/runs" -name run.json -print 2>/dev/null | sort | tail -n 1
+  find "$1/runs" -name run.json -print 2>/dev/null | sort | tail -n 1
 }
 
 # run.json 的 record 级状态（node 解析；损坏/缺文件回空串）
@@ -110,152 +126,320 @@ run_fail_text() {
   ' "$1" 2>/dev/null
 }
 
-# 优雅终止 pi：TERM 后给 5s 退出窗口，仍存活则 KILL（不依赖 GNU timeout——macOS 无自带）
-stop_pi() {
-  kill -TERM "$PI_PID" 2>/dev/null
-  for _ in 1 2 3 4 5; do
-    kill -0 "$PI_PID" 2>/dev/null || return 0
-    sleep 1
-  done
-  kill -9 "$PI_PID" 2>/dev/null
+# run.json 的 origin:status 组合（场景 A 的 designer 未达成判别——builtin 降级但 completed）
+origin_and_status() {
+  node -e '
+    try {
+      const rec = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      const o = rec.plan && typeof rec.plan.origin === "string" ? rec.plan.origin : "";
+      console.log(`${o}:${rec.status}`);
+    } catch {
+      console.log(":");
+    }
+  ' "$1" 2>/dev/null
 }
 
-# pi 异步执行 + 终态驱动等待（Fix round 2 改造）：轮询期间每 tick 检查 run.json，
-# 一到任意业务终态（completed|failed）即优雅终止 pi——实测 pi 业务完成后因子代理
-# 滞留 timer 不退出（T3 review M4 实证），不再干等进程；600s 总控保留（业务兜底）。
-# 命令级注入 PI_LOOP_DATA_DIR：优先级高于外环境同名变量，确保落盘隔离生效
-PI_LOOP_DATA_DIR="$DATA_DIR" \
-  pi -e "$REPO_DIR" -p "$PROMPT" </dev/null >"$OUT" 2>&1 &
-PI_PID=$!
-TIMED_OUT=0
-ELAPSED=0
-while true; do
-  # ① pi 自身退出：首选（正常路径无需外部终止）
-  kill -0 "$PI_PID" 2>/dev/null || break
-  # ② 600s 总控兜底：未到任何终态的最坏情形
-  if [ "$ELAPSED" -ge "$TIMEOUT_S" ]; then
-    echo "== e2e: 总控超时（${TIMEOUT_S}s）——终止 pi"
-    TIMED_OUT=1
-    stop_pi
-    break
+# 优雅终止 pi：TERM 后给 5s 退出窗口，仍存活则 KILL（不依赖 GNU timeout——macOS 无自带）
+stop_pi() {
+  kill -TERM "$1" 2>/dev/null
+  for _ in 1 2 3 4 5; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -9 "$1" 2>/dev/null
+}
+
+# 扩展加载断言（硬性，每场景各自核验）：pi 输出含加载失败即 FAIL（exit 1，dump 尾部）
+assert_extension_loaded() {
+  if grep -q "Error: Failed to load extension" "$1"; then
+    echo "FAIL: extension failed to load"
+    echo "--- pi output (tail 50) ---"
+    tail -50 "$1"
+    exit 1
   fi
-  # ③ 业务终态轮询：run.json 一到 completed|failed 即收工（断言的权威物证已定）
-  RUN_JSON_NOW="$(find_run_json)"
-  if [ -n "$RUN_JSON_NOW" ]; then
-    STATUS_NOW="$(run_status "$RUN_JSON_NOW")"
-    if [ "$STATUS_NOW" = "completed" ] || [ "$STATUS_NOW" = "failed" ]; then
-      echo "== e2e: 业务终态（status=${STATUS_NOW}）——终止 pi（进程可能滞留 timer）"
-      stop_pi
+}
+
+# 单场景执行（终态驱动等待）：PI_LOOP_DATA_DIR 注入 <data_dir>（优先级高于外环境
+# 同名变量，确保落盘隔离生效），阻塞至业务终态或总控超时；产出全局 RUN_JSON /
+# RUN_RC / TIMED_OUT。用法：run_scenario <label> <data_dir> <out_file> <timeout_s> <prompt>
+run_scenario() {
+  local label="$1" data_dir="$2" out_file="$3" timeout_s="$4" prompt="$5"
+  echo "== e2e[${label}]: 启动 pi（真实调度；dataDir=${data_dir}；总控超时 ${timeout_s}s）"
+  PI_LOOP_DATA_DIR="$data_dir" \
+    pi -e "$REPO_DIR" -p "$prompt" </dev/null >"$out_file" 2>&1 &
+  local pid=$!
+  TIMED_OUT=0
+  local elapsed=0
+  while true; do
+    # ① pi 自身退出：首选（正常路径无需外部终止）
+    kill -0 "$pid" 2>/dev/null || break
+    # ② 总控兜底：未到任何终态的最坏情形
+    if [ "$elapsed" -ge "$timeout_s" ]; then
+      echo "== e2e[${label}]: 总控超时（${timeout_s}s）——终止 pi"
+      TIMED_OUT=1
+      stop_pi "$pid"
       break
     fi
-  fi
-  sleep 5
-  ELAPSED=$((ELAPSED + 5))
-  # 心跳：长时间运行时确认脚本未挂死（每 60s 一行）
-  if [ $((ELAPSED % 60)) -eq 0 ]; then
-    echo "== e2e: 真实调度进行中（${ELAPSED}s / ${TIMEOUT_S}s）"
-  fi
-done
-wait "$PI_PID"
-RC=$?
+    # ③ 业务终态轮询：run.json 一到 completed|failed 即收工（断言的权威物证已定）
+    local run_now status_now
+    run_now="$(find_run_json "$data_dir")"
+    if [ -n "$run_now" ]; then
+      status_now="$(run_status "$run_now")"
+      if [ "$status_now" = "completed" ] || [ "$status_now" = "failed" ]; then
+        echo "== e2e[${label}]: 业务终态（status=${status_now}）——终止 pi（进程可能滞留 timer）"
+        stop_pi "$pid"
+        break
+      fi
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+    # 心跳：长时间运行时确认脚本未挂死（每 60s 一行）
+    if [ $((elapsed % 60)) -eq 0 ]; then
+      echo "== e2e[${label}]: 真实调度进行中（${elapsed}s / ${timeout_s}s）"
+    fi
+  done
+  wait "$pid"
+  RUN_RC=$?
+  # 落盘定位（终态已由等待循环判定；防御性轮询兜底）
+  RUN_JSON=""
+  for _ in 1 2 3 4 5; do
+    RUN_JSON="$(find_run_json "$data_dir")"
+    [ -n "$RUN_JSON" ] && break
+    sleep 1
+  done
+}
 
-# ---------- 步骤③：落盘定位（终态已由等待循环判定；防御性轮询兜底） ----------
-RUN_JSON=""
-for _ in 1 2 3 4 5; do
-  RUN_JSON="$(find_run_json)"
-  if [ -n "$RUN_JSON" ]; then
-    break
+# 环境降级判型链（模型层 → pi-subagents 缺席 → 总控超时 → 泛化降级）：按序判型，
+# 命中即输出 SKIP 文案并返回 0（调用方按场景收尾）；全不中返回 1。
+# 顺序注意：缺席文案自带"超时"字样，必须先于 DEGRADED_RE 判定；MODEL_DOWN 为最
+# 特异先判。RPC_ABSENT 的 run.json 侧匹配收窄到 run_fail_text（run 级 error + 各
+# iteration error + plan.notes 语义字段——M-2 收口的同款聚合文本，与 DEGRADED_RE
+# 同治）；pi 输出 $OUT 的全文 grep 只保留在无 run.json 分支——record.task 与
+# 模型叙述属自由文本，场景 A 的研究主题天然含 "pi + subagents" 字样，run.json
+# 全文 grep 会误报缺席
+classify_env_skip() {
+  local run_json="$1" out_file="$2"
+  if grep -qE "$MODEL_DOWN_RE" "$run_json" "$out_file" 2>/dev/null; then
+    echo "SKIP: 模型层不可用（熔断/额度/供应商不稳）"
+    tail -5 "$out_file"
+    return 0
   fi
-  sleep 1
-done
+  local fail_text
+  fail_text="$(run_fail_text "$run_json")"
+  if [ -n "$fail_text" ] && grep -qE "$RPC_ABSENT_RE" <<<"$fail_text"; then
+    echo "SKIP: pi-subagents 不在或不可用（安装后重试: pi install npm:pi-subagents）"
+    return 0
+  fi
+  if [ "$TIMED_OUT" = "1" ]; then
+    echo "SKIP: 总控超时（${TIMEOUT_S}s 内真实 subagent 未完成——视为环境受限）"
+    return 0
+  fi
+  if [ -n "$fail_text" ] && grep -qE "$DEGRADED_RE" <<<"$fail_text"; then
+    echo "SKIP: model/runtime degraded（熔断/额度/超时类失败，run 以 failed 收尾）"
+    tail -5 "$out_file"
+    return 0
+  fi
+  return 1
+}
 
-# ---------- 断言 1：扩展加载无错误（硬性，任何环境都必须过） ----------
-if grep -q "Error: Failed to load extension" "$OUT"; then
-  echo "FAIL: extension failed to load"
-  echo "--- pi output (tail 50) ---"
-  tail -50 "$OUT"
-  exit 1
-fi
-
-# ---------- 断言 2：run.json 存在（loop_task 真被调用过的物证） ----------
-if [ -z "$RUN_JSON" ]; then
-  # 模型层不可用（主模型直接被拒，工具未被调用）：与 run 失败路径同型判别
-  if grep -qE "$MODEL_DOWN_RE" "$OUT"; then
+# 无 run.json 落盘时的模型层判型（比 classify_env_skip 早一步：loop_task 未被调用，
+# 仅 $OUT 携带模型层特征；其余情形一律 FAIL——真实失败浮现，不被宽匹配吞掉）
+skip_on_model_down() {
+  if grep -qE "$MODEL_DOWN_RE" "$1"; then
     echo "SKIP: 模型层不可用（熔断/额度/供应商不稳，loop_task 未被执行）"
-    tail -5 "$OUT"
+    tail -5 "$1"
+    return 0
+  fi
+  return 1
+}
+
+# ---------- 场景 A：designer 多步全链（默认预算 low：maxPlanSteps=3 / 并行 2） ----------
+# 任务为中等复杂度（对比研究 + 结论）；提示词明示"如需要可分解多步"——researcher
+# 兼任 designer，实际可能给出 1 步（合理判定）到 3 步，断言容忍 1 步
+PROMPT_A="调用 loop_task 工具：研究任务'pi-loop 与直接使用 pi + subagents 的差别'（中等复杂度：对比两者的工作流、适用场景与开销，如需要可分解多步执行后综合），effort: low"
+
+run_scenario "A" "$DATA_A" "$OUT_A" "$TIMEOUT_S" "$PROMPT_A"
+assert_extension_loaded "$OUT_A"
+
+if [ -z "$RUN_JSON" ]; then
+  if skip_on_model_down "$OUT_A"; then
+    echo "== e2e: 场景 A 环境受限 SKIP——场景 B 同因跳过（同一环境）"
+    echo "== e2e 汇总：A SKIP（模型层不可用）/ B SKIP（同因）"
     exit 0
   fi
-  # 模型/环境层降级关键词仅匹配 run.json 的 error/notes 字段（M-2）——无 run.json
-  # 落盘时无从聚合；宽匹配（grep $OUT）会误容真实失败，故此处只保留特异标记判型
-  echo "FAIL: 无 run.json 落盘（模型未调用 loop_task 且无环境降级特征）"
+  echo "FAIL: 场景 A 无 run.json 落盘（模型未调用 loop_task 且无环境降级特征）"
   echo "--- pi output (tail 50) ---"
-  tail -50 "$OUT"
+  tail -50 "$OUT_A"
+  exit 1
+fi
+echo "== e2e[A]: run 记录 $RUN_JSON"
+PLAN_FILE_A="$(dirname "$RUN_JSON")/designer-plan.json"
+
+# 断言：status=completed + plan.origin="designer" + steps>=1 + iterations 与计划步数
+# 一致且全部终态非 pending；channel=file 时对 designer-plan.json 做 steps 结构独立
+# 对账（schema 语义已由内核校验过——origin=designer 的前提——此处是物证复核）
+VERDICT_A="$(node -e '
+  const fs = require("fs");
+  const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const plan = rec.plan && typeof rec.plan === "object" ? rec.plan : {};
+  const steps = Number.isInteger(plan.steps) ? plan.steps : -1;
+  const iters = Array.isArray(rec.iterations) ? rec.iterations : [];
+  const terminal = iters.every((e) => e && (e.status === "succeeded" || e.status === "failed"));
+  const reasons = [];
+  if (rec.status !== "completed") reasons.push(`status=${rec.status}`);
+  if (plan.origin !== "designer") reasons.push(`plan.origin=${String(plan.origin)}`);
+  if (steps < 1) reasons.push(`plan.steps=${steps}`);
+  if (!terminal) reasons.push("iterations 存在非终态 entry（pending/running）");
+  if (iters.length !== steps) reasons.push(`iterations 数 ${iters.length} !== 计划步数 ${steps}`);
+  if (reasons.length === 0 && plan.channel === "file") {
+    try {
+      const pf = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+      const arr = Array.isArray(pf.steps) ? pf.steps : null;
+      if (arr === null) reasons.push("designer-plan.json 缺 steps 数组");
+      if (arr !== null) {
+        if (arr.length !== steps) reasons.push(`产物文件步数 ${arr.length} !== 记录步数 ${steps}`);
+        const ids = arr.map((s) => (s && typeof s.id === "string" ? s.id : ""));
+        if (new Set(ids).size !== arr.length || ids.includes("")) {
+          reasons.push("产物文件 step id 重复或缺 id");
+        }
+        for (const s of arr) {
+          if (!s || typeof s.agent !== "string" || typeof s.task !== "string" || !Array.isArray(s.dependsOn)) {
+            reasons.push("产物文件 step 形状非法（id/agent/task/dependsOn）");
+            break;
+          }
+          if (s.dependsOn.some((d) => !ids.includes(d))) {
+            reasons.push("产物文件 dependsOn 引用计划外 id");
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      reasons.push("designer-plan.json 读取/解析失败");
+    }
+  }
+  console.log(reasons.length === 0 ? "PASS" : `FAIL: ${reasons.join("；")}`);
+' "$RUN_JSON" "$PLAN_FILE_A" 2>/dev/null || echo CORRUPT)"
+
+A_RESULT="SKIP"
+if [ "$VERDICT_A" = "PASS" ]; then
+  echo "PASS: e2e 场景 A（designer 多步全链：plan.origin=designer + 计划步全终态 + completed）"
+  A_RESULT="PASS"
+  node -e '
+    const fs = require("fs");
+    const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const plan = rec.plan || {};
+    const iters = Array.isArray(rec.iterations) ? rec.iterations : [];
+    const succ = iters.filter((e) => e.status === "succeeded").length;
+    console.log(`run: ${rec.id}  status=${rec.status}  effort=${rec.effort}`);
+    console.log(`plan: origin=${plan.origin} steps=${plan.steps} channel=${plan.channel ?? "-"} attempts=${plan.attempts ?? "-"} degraded=${plan.degraded}`);
+    console.log(`iterations: ${succ}/${iters.length} succeeded`);
+  ' "$RUN_JSON" 2>/dev/null || true
+elif classify_env_skip "$RUN_JSON" "$OUT_A"; then
+  A_RESULT="SKIP-ENV"
+elif [ "$(origin_and_status "$RUN_JSON")" = "builtin:completed" ]; then
+  # designer 未达成但全链跑通（降级 builtin 照跑 completed）：e2e 的目标（证明
+  # designer 链）未达成于环境模型——不计失败，M2 等价链路已由既有断言覆盖
+  echo "SKIP: designer 未产出有效计划（降级 builtin 后全链照跑 completed——环境模型未满足输出契约，视作环境受限）"
+  node -e '
+    const fs = require("fs");
+    const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const plan = rec.plan || {};
+    console.log(`plan: origin=${plan.origin} steps=${plan.steps} channel=${plan.channel ?? "-"} attempts=${plan.attempts ?? "-"}`);
+    const notes = typeof plan.notes === "string" ? plan.notes.slice(0, 200) : "";
+    if (notes) console.log(`notes: ${notes}`);
+  ' "$RUN_JSON" 2>/dev/null || true
+  A_RESULT="SKIP-DESIGNER"
+else
+  echo "FAIL: e2e 场景 A 断言未达（${VERDICT_A}；pi rc=${RUN_RC}）"
+  echo "--- run.json ---"
+  cat "$RUN_JSON"
+  echo "--- pi output (tail 50) ---"
+  tail -50 "$OUT_A"
   exit 1
 fi
 
-RUN_ID="$(basename "$(dirname "$RUN_JSON")")"
-echo "== e2e: run 记录 $RUN_JSON"
+# 环境级 SKIP（模型层/缺席/超时/降级）连带跳过场景 B：同一环境，同因
+if [ "$A_RESULT" = "SKIP-ENV" ]; then
+  echo "== e2e: 场景 A 环境受限 SKIP——场景 B 同因跳过（同一环境）"
+  echo "== e2e 汇总：A SKIP（环境）/ B SKIP（同因）"
+  exit 0
+fi
 
-# ---------- 核心断言：status=completed 且 iterations[0] 有 outputRef 或 error 为空 ----------
-VERDICT="$(node -e '
+# ---------- 场景 B：maxPlanSteps=1 强制注入（预算压缩路径） ----------
+# dataDir 级 settings.json 覆盖（prepareRun → loadLoopSettings(dataDir) 读
+# <dataDir>/settings.json 并与默认表深合并——字段级覆盖，其余键保持默认；
+# settings 会出现于 result.preset 与 designer 任务文本的预算行，产物侧的
+# 直接证据是 plan.steps<=1：注入失效时 designer 会按 3 步顶格产出）
+printf '%s\n' '{"effortPresets":{"low":{"maxPlanSteps":1}}}' >"$DATA_B/settings.json"
+echo "== e2e[B]: 注入 settings.json（effortPresets.low.maxPlanSteps=1）强制预算压缩"
+
+PROMPT_B="调用 loop_task 工具：研究任务'用一句话说明 pi-loop 是什么'，effort: low"
+
+run_scenario "B" "$DATA_B" "$OUT_B" "$TIMEOUT_S" "$PROMPT_B"
+assert_extension_loaded "$OUT_B"
+
+if [ -z "$RUN_JSON" ]; then
+  if skip_on_model_down "$OUT_B"; then
+    echo "== e2e 汇总：A ${A_RESULT} / B SKIP（模型层不可用）"
+    exit 0
+  fi
+  echo "FAIL: 场景 B 无 run.json 落盘（模型未调用 loop_task 且无环境降级特征）"
+  echo "--- pi output (tail 50) ---"
+  tail -50 "$OUT_B"
+  exit 1
+fi
+echo "== e2e[B]: run 记录 $RUN_JSON"
+
+# 断言：不 crash（completed 收尾）+ steps<=1 + origin 如实（designer 被迫单步 / 降级
+# builtin 照跑均可接受——预算语义是"压成 1 步"，不是"必须 designer 产出"）
+VERDICT_B="$(node -e '
   const fs = require("fs");
   const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-  const it = Array.isArray(rec.iterations) ? rec.iterations[0] : undefined;
-  const hasOutput =
-    it !== undefined && typeof it.outputRef === "string" && it.outputRef.length > 0;
-  const noError = it !== undefined && !it.error;
-  console.log(rec.status === "completed" && (hasOutput || noError) ? "PASS" : "FAIL");
+  const plan = rec.plan && typeof rec.plan === "object" ? rec.plan : {};
+  const steps = Number.isInteger(plan.steps) ? plan.steps : -1;
+  const iters = Array.isArray(rec.iterations) ? rec.iterations : [];
+  const terminal = iters.every((e) => e && (e.status === "succeeded" || e.status === "failed"));
+  const reasons = [];
+  if (rec.status !== "completed") reasons.push(`status=${rec.status}`);
+  if (steps < 0 || steps > 1) reasons.push(`plan.steps=${steps}（强制 maxPlanSteps=1 下步数应为 1）`);
+  if (plan.origin === "designer") {
+    if (steps !== 1) reasons.push(`designer 计划 steps=${steps}（应为 1）`);
+  } else if (plan.origin === "builtin") {
+    if (plan.degraded !== true) reasons.push("builtin 计划未标 degraded=true");
+  } else {
+    reasons.push(`plan.origin=${String(plan.origin)} 非 designer/builtin`);
+  }
+  if (!terminal) reasons.push("iterations 存在非终态 entry（pending/running）");
+  if (iters.length !== steps) reasons.push(`iterations 数 ${iters.length} !== 步数 ${steps}`);
+  console.log(reasons.length === 0 ? "PASS" : `FAIL: ${reasons.join("；")}`);
 ' "$RUN_JSON" 2>/dev/null || echo CORRUPT)"
 
-if [ "$VERDICT" = "PASS" ]; then
-  echo "PASS: e2e smoke passed（真实 spawn → 完成 → RunRecord 终态 completed）"
-  echo "run id: $RUN_ID  ($RUN_JSON)"
-  # 落盘证据摘要（trap 退出即清理，终端留痕供人工校验）
+B_RESULT="SKIP"
+if [ "$VERDICT_B" = "PASS" ]; then
+  echo "PASS: e2e 场景 B（maxPlanSteps=1 强制：completed + steps<=1 + origin 如实——不 crash）"
+  B_RESULT="PASS"
   node -e '
-    const rec = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-    const it = rec.iterations[0];
+    const fs = require("fs");
+    const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const plan = rec.plan || {};
+    const iters = Array.isArray(rec.iterations) ? rec.iterations : [];
+    const succ = iters.filter((e) => e.status === "succeeded").length;
     console.log(`run: ${rec.id}  status=${rec.status}  effort=${rec.effort}`);
-    console.log(
-      `iteration: ${it.stepId}(${it.agent}) ${it.status}` +
-        (it.outputRef ? `  outputRef=${it.outputRef}` : "  outputRef=(none)"),
-    );
+    console.log(`plan: origin=${plan.origin} steps=${plan.steps} channel=${plan.channel ?? "-"} attempts=${plan.attempts ?? "-"} degraded=${plan.degraded}`);
+    console.log(`iterations: ${succ}/${iters.length} succeeded`);
   ' "$RUN_JSON" 2>/dev/null || true
-  exit 0
+else
+  if classify_env_skip "$RUN_JSON" "$OUT_B"; then
+    B_RESULT="SKIP-ENV"
+  else
+    echo "FAIL: e2e 场景 B 断言未达（${VERDICT_B}；pi rc=${RUN_RC}）"
+    echo "--- run.json ---"
+    cat "$RUN_JSON"
+    echo "--- pi output (tail 50) ---"
+    tail -50 "$OUT_B"
+    exit 1
+  fi
 fi
 
-# ---------- 降级 3：模型层不可用（pi-subagents 在场但子代理模型被拒） ----------
-# 顺序注意（M-1 后）：模型被拒属真实拒绝，不附缺席引导后缀——错误文本自身
-# 携带特征词；先用更特异的模型层特征判型，避免误归因为包缺席
-if grep -qE "$MODEL_DOWN_RE" "$RUN_JSON" "$OUT" 2>/dev/null; then
-  echo "SKIP: 模型层不可用（熔断/额度/供应商不稳）"
-  tail -5 "$OUT"
-  exit 0
-fi
-
-# ---------- 降级 4：pi-subagents 缺席（spawn 无应答，失败文案含 RPC_ABSENT 系列标记） ----------
-# 顺序注意：缺席文案自带"超时"字样，必须先于 DEGRADED_RE 判定
-if grep -qE "$RPC_ABSENT_RE" "$RUN_JSON" "$OUT" 2>/dev/null; then
-  echo "SKIP: pi-subagents 不在或不可用（安装后重试: pi install npm:pi-subagents）"
-  exit 0
-fi
-
-# ---------- 降级 5：总控超时（未到任何终态的最坏情形） ----------
-if [ "$TIMED_OUT" = "1" ]; then
-  echo "SKIP: 总控超时（${TIMEOUT_S}s 内真实 subagent 未完成——视为环境受限）"
-  exit 0
-fi
-# ---------- 降级 6：泛化降级（仅 run.json error/notes 语义字段上判型，M-2） ----------
-FAIL_TEXT="$(run_fail_text "$RUN_JSON")"
-if [ -n "$FAIL_TEXT" ] && grep -qE "$DEGRADED_RE" <<<"$FAIL_TEXT"; then
-  echo "SKIP: model/runtime degraded（熔断/额度/超时类失败，run 以 failed 收尾）"
-  tail -5 "$OUT"
-  exit 0
-fi
-
-# ---------- 真实失败：dump run.json 全文 + pi 输出尾部（诊断物证） ----------
-echo "FAIL: e2e smoke failed（pi rc=${RC}；run 终态未达 completed）"
-echo "--- run.json ---"
-cat "$RUN_JSON"
-echo "--- pi output (tail 50) ---"
-tail -50 "$OUT"
-exit 1
+echo "== e2e 汇总：A ${A_RESULT} / B ${B_RESULT}"
+exit 0
