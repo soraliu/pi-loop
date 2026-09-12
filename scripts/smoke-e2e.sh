@@ -99,7 +99,7 @@ OUT_C="$(mktemp /tmp/pi-loop-e2e-out-XXXXXX.log)"
 # 「物证保留于 ...」打印路径；缺省（未设或非 1）行为与此前完全一致——退出即清理。
 # 失败路径不受影响（FAIL 分支已先行 dump，保留的物证反而是更完整的复核材料）。
 if [ "${KEEP_ARTIFACTS:-0}" = "1" ]; then
-  trap 'echo "物证保留于：$DATA_A $DATA_B $DATA_C（pi 输出：$OUT_A $OUT_B $OUT_C）"' EXIT
+  trap 'echo "物证保留于：${DATA_A} ${DATA_B} ${DATA_C}（pi 输出：${OUT_A} ${OUT_B} ${OUT_C}）"' EXIT
   echo "== e2e: KEEP_ARTIFACTS=1——退出时保留各场景 dataDir 与 pi 输出日志（默认清理）"
 else
   trap 'rm -rf "$DATA_A" "$OUT_A" "$DATA_B" "$OUT_B" "$DATA_C" "$OUT_C"' EXIT
