@@ -4,7 +4,7 @@
 import { Type } from "@sinclair/typebox";
 
 import type { PiExtensionApi, ToolResponse } from "./api.ts";
-import { describeStepUpdate, runLoopTask } from "./loop-task.ts";
+import { describeIterateUpdate, runLoopTask } from "./loop-task.ts";
 import type { LoopToolParams, LoopToolResult } from "../types.ts";
 
 /** loop_task 的 typebox 参数 schema——与 SPEC §6 一字不差（task 必填，其余可选） */
@@ -38,7 +38,7 @@ type SchemaParams = {
   contextPaths?: string[];
 };
 
-/** LoopToolResult 的 JSON 序列化（含遥测真值/计划摘要/失败原因，转文本 content 给模型） */
+/** LoopToolResult 的 JSON 序列化（含遥测真值/计划摘要/评估摘要/失败原因，转文本 content 给模型） */
 function resultToText(result: LoopToolResult): string {
   const payload: Record<string, unknown> = {
     status: result.status,
@@ -49,6 +49,7 @@ function resultToText(result: LoopToolResult): string {
     summary: result.summary,
   };
   if (result.plan !== undefined) payload.plan = result.plan; // M3-T4：工具可见的计划摘要（origin/steps/degraded）
+  if (result.evaluation !== undefined) payload.evaluation = result.evaluation; // M4-T2：评估结论摘要（verdict/score/round）
   if (result.error !== undefined) payload.error = result.error;
   return JSON.stringify(payload, null, 2);
 }
@@ -93,7 +94,9 @@ function makeExecuteLoopTask(pi: PiExtensionApi) {
             ? undefined
             : (update) =>
                 onUpdate({
-                  content: [{ type: "text", text: describeStepUpdate(update) }],
+                  content: [
+                    { type: "text", text: describeIterateUpdate(update) },
+                  ],
                 }),
       });
       return {
@@ -120,8 +123,8 @@ export function registerLoopTools(pi: PiExtensionApi): void {
     label: "Loop Task",
     description:
       "pi-loop 自主研究引擎入口：指派一个任务（研究/分析/构建），由它自主设计研究方法、调度 subagents 并迭代优化结果。" +
-      "task 必填；effort 控制迭代激进度（low=最多1轮迭代 low成本 / medium=2轮 / high=3轮 / max=5轮，缺省 medium）；" +
-      "verifyCommand 可选，提供机器验收命令时优先于 critic 打分作为迭代判定依据。",
+      "task 必填；effort 控制迭代激进度（low=最多1轮重跑 / medium=2轮 / high=3轮 / max=5轮，缺省 medium）；" +
+      "verifyCommand 可选，提供机器验收命令时优先于 critic 打分作为迭代判定依据；评估不达标时自动注入失败归因重跑，预算尽如实收尾 budget_exhausted。",
     parameters: LoopTaskParamsSchema,
     execute: makeExecuteLoopTask(pi),
   });

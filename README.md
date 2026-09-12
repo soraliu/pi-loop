@@ -8,7 +8,7 @@
 
 1. **设计**：检索方法论库与相似历史案例，产出结构化研究计划（`ResearchPlan`：任务分解、subagent 角色与提示词、验证标准、预算）
 2. **调度**：通过 pi-subagents 的官方 RPC 通道驱动 subagent 团队执行计划
-3. **评估**：critic agent 多维 rubric 打分 + 可选机器断言（`verifyCommand`），失败自动归因
+3. **评估**：可选机器断言（`verifyCommand`，在场即唯一权威）+ critic agent 多维 rubric 打分，失败自动归因
 4. **迭代**：不达标时注入失败原因、改良提示词后重跑（预算内）
 5. **沉淀**：案例与方法论入档；方法论修订走 git keep/rollback（DGM 选择压力：有证据才保留）
 
@@ -23,6 +23,7 @@ pi install git:github.com/soraliu/pi-loop
 ```text
 /loop 研究 rust tokio 和 async-std 的调度器差异，产出对比报告     # 交互式启动
 /loop --effort max 写一个 redis 简化版并附基准测试                # 激进迭代
+/loop --effort low 实现解析工具并补单测 --verify "npm test"      # 机器断言验收（M4，见下文）
 /loop-status                                                     # 查看最近运行
 /loop-cases                                                      # 查看案例档案
 /loop-methods                                                    # 查看方法论库
@@ -53,20 +54,23 @@ iteration 记录、outputRef 与耗时遥测）。
   `loop_task` / `/loop` 以 `status=failed` 收尾，error 携带安装引导文案，
   不会挂死或裸崩（RPC 受理超时兜底）。
 - 其余失败（模型层熔断/额度/网络）同样收敛为 failed 结果，可从 run.json 审计。
-- 尚未接入：失败归因与迭代重跑（M4）、案例与方法论实档（M5）——`/loop-cases`
-  与 `/loop-methods` 仍为统计 stub。（动态计划已由 M3 接入，见下节）
+- 尚未接入：案例与方法论实档（M5）——`/loop-cases` 与 `/loop-methods` 仍是
+  统计 stub。（动态计划已由 M3 接入、评估与迭代闭环已由 M4 接入，见后续两节）
 
 ### 冒烟验证（本地，不入 CI）
 
 | 脚本 | 覆盖 | 前置条件 | 量级 |
 | --- | --- | --- | --- |
 | `npm run smoke`（`scripts/smoke.sh`，M1） | 结构冒烟：扩展可加载、`loop_task` 可被调用、run id 落盘 | `pi` 命令 | 秒级 |
-| `bash scripts/smoke-e2e.sh`（M2 → M3 双场景） | 全链冒烟：场景 A designer 动态计划 + 逐步 spawn；场景 B `maxPlanSteps=1` 预算强制（详见下节） | `pi` + `pi-subagents` + 可用模型与额度 + 用户级 researcher agent | 分钟级（两场景） |
+| `bash scripts/smoke-e2e.sh`（M2 → M4 三场景） | 全链冒烟：场景 A designer 动态计划 + 逐步 spawn；场景 B `maxPlanSteps=1` 预算强制；场景 C `verifyCommand` 机器断言端到端（详见后续小节） | `pi` + `pi-subagents` + 可用模型与额度 + 用户级 researcher agent | 分钟级（三场景） |
 
 两脚本降级语义一致：环境不满足（pi 缺失 / pi-subagents 缺席 / 模型熔断或额度耗尽）
 时 `SKIP` / `DEGRADED-PASS` 并 exit 0，只有断言真实失败才 exit 1。
 `smoke-e2e.sh` 不隔离 HOME（真实 spawn 需要用户级 agent 定义），但把
 `PI_LOOP_DATA_DIR` 指向临时目录——run 落盘隔离，不污染真实 `~/.pi/loop/`。
+需要留档物证（终帧 run.json / designer-plan.json）时用
+`KEEP_ARTIFACTS=1 bash scripts/smoke-e2e.sh` 运行——退出时保留各场景的
+dataDir 与 pi 输出日志并打印路径，默认退出即清理。
 
 ### 调试降级：`PI_LOOP_STUB=1`
 
@@ -119,6 +123,39 @@ iteration 记录、outputRef 与耗时遥测）。
 档位可用 `~/.pi/loop/settings.json` 的 `effortPresets.<档>.*` 深合并覆盖，例如
 `{"effortPresets": {"low": {"maxPlanSteps": 1}}}`（e2e 冒烟场景 B 即用此法
 注入强制路径；实现语义见上表）。
+
+## M4 能力：评估与迭代闭环（Evaluator）
+
+`/loop` 与 `loop_task` 自 M4 起不再一次成败听天由命：每轮执行完成后先评估，未达
+标自动注入失败归因重跑（预算内），通过或预算耗尽才收尾——SPEC §4 的
+evaluate → 注入 → 重跑 闭环落地。
+
+- **双通道评估（互斥，verifyCommand 优先）**：`verifyCommand` 在场即机器断言唯一
+  权威——命令经安全分词（无 shell 语法，未闭合引号拒收）后在 dataDir 工作区执行
+  （cwd 隔离，SPEC §7.5），exit 0 → verified（stdout 含 `2/3 passed` 类计数时按
+  比例计分，否则满分 100），非 0 → fail（退出码与 stderr 尾部如实入 reasons；
+  超时 60s 同样 fail）；未提供时才 spawn critic（`researcher` 兼任）依据任务原文
+  与各步执行记录做 rubric 打分。verifyCommand 在场零 critic spawn——效率语义由
+  单测锁定，e2e 冒烟场景 C 端到端复核。
+- **诚实遥测（SPEC §7.4）**：evaluator 自身的任何故障（命令超时/不存在/语法错、
+  critic spawn 失败/围栏解析失败）一律收敛为 fail + 原因如实——绝不因"拿不到
+  证据"而自判通过。
+- **归因注入重跑（最小注入面）**：critic 指认的失败步骤（blame）在下一轮的提示词
+  前缀注入上轮失败原因，原计划保留；verifyCommand 通道 blame 恒空（退出码断言无
+  轮次归因概念），重跑为原样重跑。连续两轮全部步骤同因失败才触发重新设计计划
+  （fresh 计划不注入——单一失败轮不重设计，防设计漂移）。
+- **预算耗尽如实收尾**：迭代轮数达 `maxResultIterations`（low=1 … max=5，见
+  预设表）仍未通过 → 结果 `status="budget_exhausted"`，error 如实说明轮数与末轮
+  结论，最后一轮 `evaluation` 与 `final` 留档——partial/fail 不丢、不虚报通过。
+- **物证留档**：run.json 新增 `round`（当前轮）、`evaluation`（最终轮结论：
+  verdict / score / reasons / blame）与 `final`（收尾摘要：round / verdict /
+  score）；工具结果与 `/loop` 收尾通知同步携带 evaluation 摘要。
+
+`/loop --verify`（等价于 `loop_task` 的 `verifyCommand` 入参）用法：
+
+```text
+/loop --effort low 实现工具函数并补单测 --verify "npm test"   # 退出码即验收结论
+```
 
 ## 开发
 

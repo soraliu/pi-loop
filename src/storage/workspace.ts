@@ -9,9 +9,11 @@ import * as path from "node:path";
 
 import type {
 	EffortLevel,
+	Evaluation,
 	IterationEntry,
 	RunPlanInfo,
 	RunSummary,
+	RunTelemetry,
 } from "../types.ts";
 
 /** 生产环境默认数据根目录（~/.pi/loop/） */
@@ -25,8 +27,21 @@ export interface RunRecord extends RunSummary {
 	task: string;
 	/** 迭代记录（Orchestrator 按计划步骤追加；M1 阶段恒为空数组） */
 	iterations: IterationEntry[];
-	/** 计划元信息（M3-T4：designer 生成/降级的诚实遥测——generatePlan 返回即写，执行中不变） */
+	/** 计划元信息（M3-T4：designer 生成/降级的诚实遥测——generatePlan 返回即写，执行中不变；M4-T2 重设计时由迭代引擎经 adapter 再写） */
 	plan?: RunPlanInfo;
+	/** 当前迭代轮（M4-T2：0 起计——0=首轮；执行中随每轮更新，终止时为最后执行的轮） */
+	round?: number;
+	/** 最终轮评估结论（M4-T2：迭代闭环终止时留档——预算尽时最后一轮的 partial/fail 不丢） */
+	evaluation?: Evaluation;
+	/** 收尾摘要（M4-T2：终止时写——最终轮轮次与结论三键） */
+	final?: { round: number; verdict: Evaluation["verdict"]; score: number };
+	/**
+	 * 运行遥测（M4-T3：迭代闭环终止时随终态落盘）。steps/succeeded/failed 按末轮
+	 * 口径（与 LoopToolResult.telemetry 同源）、iterations 为累计调度次数、agents
+	 * 为全部轮次 entry 的 agent 去重计数；诚实遥测：零执行事实（无 entry 的拒绝/
+	 * 预中止路径）时整个块 omit，不写假 0。
+	 */
+	telemetry?: RunTelemetry;
 }
 
 /** run id：`r-<epoch36>` 加短随机后缀，防同毫秒碰撞且按创建时间天然有序 */

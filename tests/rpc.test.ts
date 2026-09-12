@@ -225,6 +225,28 @@ describe("SubagentsRpcClient.spawn 的受理归一化（M3-T5 Fix round 2，e2e 
 		await expect(pending).resolves.toMatchObject({ runId: "r-fb-9" });
 	});
 
+	it("受理头不在 text 首行 → 正则不命中（^ 锚定收口，M3 终审 M-2 债/M4-T0）", async () => {
+		const bus = new FakeBus();
+		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 1000 });
+		const pending = client.spawn({
+			agent: "researcher",
+			task: "正文提及受理头形态",
+		});
+		// details 变形（无 runId/asyncId）让受理头正则成为唯一提取通道——而 "Async: …"
+		// 出现在第二行（首行是前置说明）：受理头语义是 text 首行，正文中的形态不算
+		bus.replyLast({
+			success: true,
+			data: {
+				text:
+					"受理 guidance 的前置说明行：\nAsync: researcher [r-not-first-line]\n（正文内容）",
+				details: { mode: "single", results: [] },
+			},
+		});
+		const acceptance = await pending;
+		// 不误把正文行当受理头（未锚定时会提取 r-not-first-line——本用例即红）
+		expect(acceptance.runId).toBeUndefined();
+	});
+
 	it("顶层 runId（M2 造形）保持原样——向后兼容", async () => {
 		const bus = new FakeBus();
 		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 1000 });

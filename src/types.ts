@@ -43,7 +43,11 @@ export interface LoopToolParams {
 	contextPaths?: string[];
 }
 
-/** Run 遥测（M2-T4 起由调度内核 RunOutcome 填充；stub 路径为全零占位） */
+/**
+ * Run 遥测（M2-T4 起由调度内核 RunOutcome 填充；stub 路径为全零占位；M4-T3
+ * 起随终态落盘 RunRecord.telemetry）。SPEC §5 的 turns 字段无从获得真实轮次
+ * 数据——诚实遥测：不可得字段 omit、不造假数值（对账见 docs/spec5-runrecord-gap.md）。
+ */
 export interface RunTelemetry {
 	/** 计划步骤总数 */
 	steps: number;
@@ -55,6 +59,12 @@ export interface RunTelemetry {
 	iterations: number;
 	/** 调度核心耗时（毫秒） */
 	durationMs: number;
+	/**
+	 * 真实 spawn 过的不同 agent 计数（M4-T3）：全部轮次 entry 的 agent 去重——同一
+	 * agent 多步多轮只计 1。诚实遥测：无执行事实（零 entry）时 omit 不写假 0——
+	 * 故为可选字段（stub 与拒绝路径不落键）。
+	 */
+	agents?: number;
 }
 
 /**
@@ -102,6 +112,15 @@ export interface LoopToolResult {
 	summary?: string;
 	/** 失败原因（status=failed 时给可操作信息，如 pi-subagents 安装引导；中止记 "aborted"） */
 	error?: string;
+	/** 评估结论摘要（M4-T2：迭代闭环最终轮 evaluation 的结果侧投影） */
+	evaluation?: {
+		/** 最终轮结论（verified 首见即终；budget_exhausted/failed 为终止轮的末次评估） */
+		verdict: Evaluation["verdict"];
+		/** 最终轮评分（clamp 0-100 整数） */
+		score: number;
+		/** 终止（通过或预算尽/中止）时所在的迭代轮（0 起计，0=首轮） */
+		round: number;
+	};
 }
 
 /** Run 的只读摘要（/loop-status 列表与调度内核使用） */
@@ -188,4 +207,30 @@ export interface IterationEntry {
 	endedAt?: string;
 	/** 失败原因（status=failed 时） */
 	error?: string;
+	/** 所属迭代轮（M4-T2：0 起计——0=首轮；多轮执行的 entry 分轮归组，读取侧按 round 分组展示。orchestrator 落盘时不感知轮次，由迭代引擎补标） */
+	round?: number;
+}
+
+/* ================================================================
+ * 评估结论（M4-T1：Evaluator 的输出形状——verifyCommand 机器断言或 critic rubric 二择其一的产物）
+ * ================================================================ */
+
+/**
+ * Evaluator 的评估结论（src/core/evaluator.ts 的返回；M4-T2 起落入 RunRecord.evaluation
+ * 与 LoopToolResult 摘要）。
+ * 诚实遥测（SPEC §7.4）：verified 只能来自 verifyCommand 的机器断言或 critic 结论
+ * 原文——evaluator 自身的任何故障一律收敛为 fail（不自判通过）。
+ */
+export interface Evaluation {
+	/** 结论三态：verified=验收通过；partial=部分达成（判定权在 critic——机器断言不产生中间态）；fail=未通过 */
+	verdict: "verified" | "partial" | "fail";
+	/** 0 到 100 的整数分（evaluator 对一切来源的输入 clamp 到该区间） */
+	score: number;
+	/**
+	 * 结论依据（中文可读句子数组）。verifyCommand 通道携带退出码/stderr 尾部等执行事实；
+	 * critic 通道为 critic 围栏 JSON 的 reasons 原文（外加幽灵 blame 过滤的警告）。
+	 */
+	reasons: string[];
+	/** 归因 stepId 列表：critic 通道来自 critic 指认（已过滤不存在的 id）；verifyCommand 机器断言通道恒为空数组——退出码没有轮次归因概念（细节在 reasons） */
+	blame: string[];
 }

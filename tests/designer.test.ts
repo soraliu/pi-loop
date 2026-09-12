@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { COMPLETION_TIMEOUT_MS } from "../src/core/consts.ts";
 import { generatePlan } from "../src/core/designer.ts";
 import { BUILTIN_PLAN } from "../src/core/planner-static.ts";
 import { DEFAULT_EFFORT_PRESETS } from "../src/storage/settings.ts";
@@ -267,8 +268,11 @@ describe("generatePlan — 产物双通道（文件优先，围栏次之）", ()
 		expect(text).toContain("```json");
 		expect(text).toContain("designer-plan.json");
 
-		// 完成等待口径：按受理 runId 等待，10 分钟超时（对齐 orchestrator 步完成常量）
-		expect(fake.waits).toEqual([{ runId: spawn.runId, timeoutMs: 10 * 60_000 }]);
+		// 完成等待口径：按受理 runId 等待，10 分钟超时（单一真源 consts.COMPLETION_TIMEOUT_MS，
+		// M4-T0 收敛后改绑常量断言——值不变，锁的是 designer→consts 的 wiring）
+		expect(fake.waits).toEqual([
+			{ runId: spawn.runId, timeoutMs: COMPLETION_TIMEOUT_MS },
+		]);
 		expect(fake.stopCalls).toEqual([]);
 	});
 

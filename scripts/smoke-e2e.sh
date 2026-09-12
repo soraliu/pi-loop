@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-loop 端到端冒烟脚本（M2-T5 → M3-T5 双场景升级）
+# pi-loop 端到端冒烟脚本（M2-T5 → M3-T5 → M4-T4 三场景升级）
 # 验证链路：真实 pi 宿主加载扩展 → 模型调用 loop_task → designer 动态生成计划
 # （researcher 兼任设计）→ pi-subagents 真实逐层 spawn → 完成事件回写 → 断言 run.json。
 #
@@ -12,6 +12,17 @@
 #   压成 1（loadLoopSettings 读 <dataDir>/settings.json 深合并——M1 合并语义，
 #   无需任何 env 钩子）→ designer 被迫单步（schema 侧 maxSteps=1 拒绝多步）或
 #   降级 builtin → 断言不 crash + steps<=1 + origin 如实。
+# 场景 C（verifyCommand 机器断言端到端，M4-T4）：prompt 要求 pi 调 loop_task 时
+#   携带 verifyCommand 入参（工具 schema 原生字段，明示"原样传递不要改写"）→
+#   评估走机器断言通道而非 critic。核心断言：run.json status=completed +
+#   evaluation.verdict=verified + score>0 + reasons 携带「机器断言通过」标记
+#   （verifyCommand 通道专属文案——critic 通道的 reasons 是围栏 JSON 原文；
+#   等价证明本轮评估零 critic spawn，完整的 spawn 计数断言由单测 fake rpc
+#   锁定）+ blame 恒空（退出码断言无轮次归因概念）。
+#
+# 物证留档（M3 终审附随义务）：默认各场景 mktemp 全新目录、退出即清理；
+#   KEEP_ARTIFACTS=1 时保留全部 dataDir 与 pi 输出日志并打印路径（详见 trap
+#   处注释），供白天窗口复核终帧 run.json / designer-plan.json。
 #
 # 与 scripts/smoke.sh（M1 结构冒烟）的分工：
 #   smoke.sh    只验证"扩展可加载 + 工具可被调用、run id 落盘"（秒级，不真实 spawn）；
@@ -30,10 +41,11 @@
 #       pi-subagents 缺席、模型层熔断或额度耗尽、总控超时、泛化降级；
 #       designer 未产出有效计划但内建计划照跑 completed 也视作 SKIP——e2e 的
 #       目标是证明 designer 链，环境模型未满足输出契约时不计失败）；
-#       场景 A 的环境级 SKIP 会连带跳过场景 B（同一环境同因）；
+#       场景 A 的环境级 SKIP 会连带跳过场景 B/C（同一环境同因）；
 #   1 = 断言真实失败（扩展加载失败 / run.json 终态非预期 / 无落盘），dump 诊断。
 #
-# 用法：bash scripts/smoke-e2e.sh（可重复本地运行；每次 mktemp 全新目录，退出即清理）
+# 用法：bash scripts/smoke-e2e.sh（可重复本地运行；每次 mktemp 全新目录，退出即清理；
+#   KEEP_ARTIFACTS=1 bash scripts/smoke-e2e.sh 则保留物证不清理）
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,7 +91,19 @@ DATA_A="$(mktemp -d /tmp/pi-loop-e2e-data-XXXXXX)"
 OUT_A="$(mktemp /tmp/pi-loop-e2e-out-XXXXXX.log)"
 DATA_B="$(mktemp -d /tmp/pi-loop-e2e-data-XXXXXX)"
 OUT_B="$(mktemp /tmp/pi-loop-e2e-out-XXXXXX.log)"
-trap 'rm -rf "$DATA_A" "$OUT_A" "$DATA_B" "$OUT_B"' EXIT
+DATA_C="$(mktemp -d /tmp/pi-loop-e2e-data-XXXXXX)"
+OUT_C="$(mktemp /tmp/pi-loop-e2e-out-XXXXXX.log)"
+
+# 物证留档开关（M3 终审附随义务 → M4-T4）：KEEP_ARTIFACTS=1 时 trap 改为保留全部
+# dataDir 与 pi 输出日志（终帧 run.json / designer-plan.json 可事后审计），并以
+# 「物证保留于 ...」打印路径；缺省（未设或非 1）行为与此前完全一致——退出即清理。
+# 失败路径不受影响（FAIL 分支已先行 dump，保留的物证反而是更完整的复核材料）。
+if [ "${KEEP_ARTIFACTS:-0}" = "1" ]; then
+  trap 'echo "物证保留于：${DATA_A} ${DATA_B} ${DATA_C}（pi 输出：${OUT_A} ${OUT_B} ${OUT_C}）"' EXIT
+  echo "== e2e: KEEP_ARTIFACTS=1——退出时保留各场景 dataDir 与 pi 输出日志（默认清理）"
+else
+  trap 'rm -rf "$DATA_A" "$OUT_A" "$DATA_B" "$OUT_B" "$DATA_C" "$OUT_C"' EXIT
+fi
 
 # e2e 必须走真实调度：清除可能从外环境泄漏的 M1 stub 开关
 unset PI_LOOP_STUB
@@ -263,8 +287,8 @@ assert_extension_loaded "$OUT_A"
 
 if [ -z "$RUN_JSON" ]; then
   if skip_on_model_down "$OUT_A"; then
-    echo "== e2e: 场景 A 环境受限 SKIP——场景 B 同因跳过（同一环境）"
-    echo "== e2e 汇总：A SKIP（模型层不可用）/ B SKIP（同因）"
+    echo "== e2e: 场景 A 环境受限 SKIP——场景 B/C 同因跳过（同一环境）"
+    echo "== e2e 汇总：A SKIP（模型层不可用）/ B SKIP（同因）/ C SKIP（同因）"
     exit 0
   fi
   echo "FAIL: 场景 A 无 run.json 落盘（模型未调用 loop_task 且无环境降级特征）"
@@ -358,10 +382,10 @@ else
   exit 1
 fi
 
-# 环境级 SKIP（模型层/缺席/超时/降级）连带跳过场景 B：同一环境，同因
+# 环境级 SKIP（模型层/缺席/超时/降级）连带跳过场景 B 与 C：同一环境，同因
 if [ "$A_RESULT" = "SKIP-ENV" ]; then
-  echo "== e2e: 场景 A 环境受限 SKIP——场景 B 同因跳过（同一环境）"
-  echo "== e2e 汇总：A SKIP（环境）/ B SKIP（同因）"
+  echo "== e2e: 场景 A 环境受限 SKIP——场景 B/C 同因跳过（同一环境）"
+  echo "== e2e 汇总：A SKIP（环境）/ B SKIP（同因）/ C SKIP（同因）"
   exit 0
 fi
 
@@ -380,7 +404,7 @@ assert_extension_loaded "$OUT_B"
 
 if [ -z "$RUN_JSON" ]; then
   if skip_on_model_down "$OUT_B"; then
-    echo "== e2e 汇总：A ${A_RESULT} / B SKIP（模型层不可用）"
+    echo "== e2e 汇总：A ${A_RESULT} / B SKIP（模型层不可用）/ C SKIP（同因）"
     exit 0
   fi
   echo "FAIL: 场景 B 无 run.json 落盘（模型未调用 loop_task 且无环境降级特征）"
@@ -441,5 +465,77 @@ else
   fi
 fi
 
-echo "== e2e 汇总：A ${A_RESULT} / B ${B_RESULT}"
+# ---------- 场景 C：verifyCommand 机器断言端到端（M4-T4） ----------
+# prompt 明示把下述命令字符串原样作 verifyCommand 入参（工具 schema 原生字段）。
+# 命令选型：node 单行脚本断言 `runs` 目录非空，理由：① 环境无关——node 随 pi
+# 宿主必在，且命令不含 shell 语法（evaluator 以 shell:false + 安全分词执行，
+# 单引号包裹的 JS 体含空格不拆参）；② 无 env 继承依赖——evaluator 以 dataDir
+# 为命令 cwd（SPEC §7.5 幂等工作区），相对路径 runs 即锚定本场景 dataDir；
+# ③ 评估时刻 runs 必非空（prepareRun 的 ensureWorkspace + createRunRecord 先行
+# 建 run 目录）→ 命令确定性 exit 0——断言锚定引擎不变量而非任务产物，不随子
+# 代理产出波动（任务语义层面的 verifyCommand 优先级/计数计分等已由单测锁定）。
+PROMPT_C="调用 loop_task 工具：研究任务'用一句话说明 verifyCommand 机器断言的作用'，effort: low；同时传入 verifyCommand 参数，其值必须原样使用下面这条命令字符串（不要改写、不要转述）：node -e 'require(\"fs\").readdirSync(\"runs\").length>0?process.exit(0):process.exit(1)'"
+
+run_scenario "C" "$DATA_C" "$OUT_C" "$TIMEOUT_S" "$PROMPT_C"
+assert_extension_loaded "$OUT_C"
+
+if [ -z "$RUN_JSON" ]; then
+  if skip_on_model_down "$OUT_C"; then
+    echo "== e2e 汇总：A ${A_RESULT} / B ${B_RESULT} / C SKIP（模型层不可用）"
+    exit 0
+  fi
+  echo "FAIL: 场景 C 无 run.json 落盘（模型未调用 loop_task 且无环境降级特征）"
+  echo "--- pi output (tail 50) ---"
+  tail -50 "$OUT_C"
+  exit 1
+fi
+echo "== e2e[C]: run 记录 $RUN_JSON"
+
+# 断言：全链 completed + 评估结论 verified + score>0 + 机器断言通道物证
+# （reasons 携带「机器断言通过」——verifyCommand 通道专属文案，critic 不产生；
+# 与之同因：该轮评估零 critic spawn）+ blame 恒空（退出码断言无轮次归因）
+VERDICT_C="$(node -e '
+  const fs = require("fs");
+  const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const ev = rec.evaluation && typeof rec.evaluation === "object" ? rec.evaluation : {};
+  const reasons = [];
+  if (rec.status !== "completed") reasons.push(`status=${rec.status}`);
+  if (ev.verdict !== "verified") reasons.push(`evaluation.verdict=${String(ev.verdict)}`);
+  if (!(Number.isInteger(ev.score) && ev.score > 0)) reasons.push(`evaluation.score=${String(ev.score)}`);
+  const evReasons = Array.isArray(ev.reasons) ? ev.reasons.map((r) => String(r)) : [];
+  if (!evReasons.some((r) => r.includes("机器断言通过"))) {
+    reasons.push("evaluation.reasons 未携带机器断言通道标记（模型可能未把 verifyCommand 原样传入，评估被 critic 通道接管）");
+  }
+  if (!Array.isArray(ev.blame) || ev.blame.length !== 0) {
+    reasons.push(`evaluation.blame=${JSON.stringify(ev.blame ?? null)}（机器断言通道应恒空）`);
+  }
+  console.log(reasons.length === 0 ? "PASS" : `FAIL: ${reasons.join("；")}`);
+' "$RUN_JSON" 2>/dev/null || echo CORRUPT)"
+
+C_RESULT="SKIP"
+if [ "$VERDICT_C" = "PASS" ]; then
+  echo "PASS: e2e 场景 C（verifyCommand 机器断言端到端：completed + verified + 零 critic 混入）"
+  C_RESULT="PASS"
+  node -e '
+    const fs = require("fs");
+    const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const ev = rec.evaluation || {};
+    const fin = rec.final || {};
+    const plan = rec.plan || {};
+    console.log(`run: ${rec.id}  status=${rec.status}  effort=${rec.effort}`);
+    console.log(`evaluation: verdict=${ev.verdict} score=${ev.score}（final round=${fin.round ?? "-"}）`);
+    console.log(`plan: origin=${plan.origin} steps=${plan.steps} channel=${plan.channel ?? "-"} degraded=${plan.degraded}`);
+  ' "$RUN_JSON" 2>/dev/null || true
+elif classify_env_skip "$RUN_JSON" "$OUT_C"; then
+  C_RESULT="SKIP-ENV"
+else
+  echo "FAIL: e2e 场景 C 断言未达（${VERDICT_C}；pi rc=${RUN_RC}）"
+  echo "--- run.json ---"
+  cat "$RUN_JSON"
+  echo "--- pi output (tail 50) ---"
+  tail -50 "$OUT_C"
+  exit 1
+fi
+
+echo "== e2e 汇总：A ${A_RESULT} / B ${B_RESULT} / C ${C_RESULT}"
 exit 0

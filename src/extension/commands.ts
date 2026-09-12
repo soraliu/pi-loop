@@ -6,10 +6,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { PlanUpdate } from "../core/orchestrator.ts";
+import type { IterateUpdate } from "../core/iterate.ts";
 import type { CommandContext, PiExtensionApi } from "./api.ts";
 import {
-  describeStepUpdate,
+  describeIterateUpdate,
+  describeRoundUpdate,
   resolveDataDir,
   runLoopTask,
 } from "./loop-task.ts";
@@ -141,20 +142,38 @@ function countFiles(dir: string): number {
 }
 
 /**
- * /loop 的进度节流器（T4-M2 复评兑现：终态可见性升级）。
+ * /loop 的进度节流器（T4-M2 复评兑现：终态可见性升级；M4-T2 轮次事件并入）。
  * 旧语义「按 stepId 仅首条胜出」会吞掉每步的终态——失败步在收尾摘要之外无感知。
  * 新语义（目标口径：3 步计划含 1 失败 → notify 数 = 开始条数(1) + 终态条数(3)）：
  * - 开始信号：首个非终态更新（running）投递一条，代表计划开跑；其后各步的
  *   running 并入该条（合并投递，不再逐步重复）；
  * - 终态：每步成功/失败各投一条（成功/失败都发；按 stepId+终态去重，迟到的
- *   重复投递静默吞掉），失败走 error 级——终态不丢是本次升级的核心。
+ *   重复投递静默吞掉），失败走 error 级——终态不丢是本次升级的核心；
+ * - 轮次事件（M4-T2）：每轮开始/结束各投一条（迭代引擎保证每轮恰两条，无
+ *   节流必要），同时在轮边界重置节流状态——新一轮里同 stepId 的开始/终态
+ *   重新可见（多轮重跑不吞进度；重设计/重试轮均适用）。
  */
 export function makeStepNotifier(
   notify: (message: string, level?: "info" | "warning" | "error") => void,
-): (update: PlanUpdate) => void {
+): (update: IterateUpdate) => void {
   let startNotified = false;
   const terminalSeen = new Set<string>();
   return (update) => {
+    // 轮次事件：文案同源（describeRoundUpdate）；未通过的轮终态降 warning 级
+    // （终局结论另由收尾摘要投递，不重复用 error 级宣判）
+    if ("kind" in update) {
+      startNotified = false;
+      terminalSeen.clear();
+      notify(
+        describeRoundUpdate(update),
+        update.phase === "end" &&
+          update.verdict !== undefined &&
+          update.verdict !== "verified"
+          ? "warning"
+          : "info",
+      );
+      return;
+    }
     if (update.status === "succeeded" || update.status === "failed") {
       const key = `${update.stepId}\u0000${update.status}`;
       // 终态去重：同 stepId 同终态的迟到重复投递静默吞掉
@@ -167,7 +186,7 @@ export function makeStepNotifier(
       startNotified = true;
     }
     notify(
-      describeStepUpdate(update),
+      describeIterateUpdate(update),
       update.status === "failed" ? "error" : "info",
     );
   };
@@ -194,7 +213,7 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
           ? {}
           : { contextPaths: parsed.contextPaths }),
       };
-      // 进度：开始 1 条 + 每步终态 1 条（makeStepNotifier 节流）；完成后另发一条摘要
+      // 进度：开始 1 条 + 每步终态 1 条 + 每轮首尾各 1 条（makeStepNotifier 节流）；完成后另发一条摘要
       const notifyStep = makeStepNotifier(ctx.ui.notify);
       try {
         const result = await runLoopTask(params, {

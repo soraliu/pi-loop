@@ -13,34 +13,30 @@
 //   ⑤ rpc 层失败（spawn 受理拒绝 / 完成等待超时）→ 不重试直接降级（与"校验重试"区分）
 //   ⑥ 降级 = BUILTIN_PLAN + notes 如实记原因（诚实遥测：降级禁止冒充正常生成）
 //
-// 口径复用声明（本地固化而非 import 的项）：orchestrator.ts 的
-// STEP_COMPLETION_TIMEOUT_MS / STOP_TIMEOUT_MS / createAbortWatch 在本项目并行期由
-// M3-T3 任务维护故本地同口径实现（10 分钟 / 10 秒 / 同款 abort 竞速），漂移由测试的
-// timeoutMs 断言锁定；M3-T5 起唯一例外：isNoReplyTimeout 特征判别（已导出）经 import
-// 复用——spawn 失败的安装引导门控与 orchestrator 的 M-1 单一真源（M3-T4 review M-2）。
+// 口径复用声明（M4-T0 起，M3 终审 M-5 债收口）：完成等待 / stop 收尾超时与 abortWatch
+// 竞速哨兵共享 ./consts.ts 单一真源（M3 并行期的本地同口径固化结束——常量值不变只是
+// 搬家，既有 timeoutMs 断言零回归）；isNoReplyTimeout 特征判别（orchestrator 导出）
+// 仍是安装引导门控的单一真源（M3-T4 review M-2）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import {
+	ABORTED,
+	COMPLETION_TIMEOUT_MS,
+	STOP_TIMEOUT_MS,
+	createAbortWatch,
+} from "./consts.ts";
 import { isNoReplyTimeout } from "./orchestrator.ts";
 import { validateResearchPlan } from "./plan-schema.ts";
 import { BUILTIN_PLAN } from "./planner-static.ts";
 import type { SubagentsRpcClient } from "./rpc.ts";
 import type { EffortPreset, ResearchPlan } from "../types.ts";
 
-/** designer 单次 spawn 的完成等待上限：真实研究 agent 可跑数分钟，取保守宽裕值（口径对齐 orchestrator 的 STEP_COMPLETION_TIMEOUT_MS——10 分钟） */
-const COMPLETION_TIMEOUT_MS = 10 * 60_000;
-
-/** abort 收尾时 stop 在途 run 的等待上界：超时即放弃确认，不阻断降级收尾（口径对齐 orchestrator 的 STOP_TIMEOUT_MS） */
-const STOP_TIMEOUT_MS = 10_000;
-
 /** 校验失败的重试次数上限（SPEC §4：schema 校验失败即重试，2 次后降级内置计划） */
 const MAX_RETRIES = 2;
 /** 总尝试次数 = 首发 1 + 重试 2（注意：与 preset.maxResultIterations 无关——那是结果迭代轮数，M4 领域） */
 const MAX_ATTEMPTS = 1 + MAX_RETRIES;
-
-/** abort 竞速哨兵：完成 payload 是对象或 null，Symbol 保证不与之混淆 */
-const ABORTED = Symbol("pi-loop:designer:aborted");
 
 /** ```json 围栏匹配（标签大小写不敏感；标签后紧跟内容也容忍），内容为捕获组 1 */
 const JSON_FENCE_RE = /```json[ \t]*\r?\n?([\s\S]*?)```/gi;
@@ -287,27 +283,6 @@ function extractPlan(
 
 	// 同一份坏计划在两通道重复报错时去重（模型只修一处）
 	return { ok: false, errors: [...new Set(errors)] };
-}
-
-/**
- * signal → 一次性 settle 的"已中止"哨兵 promise（与完成等待 Promise.race 竞速；
- * 形状对齐 orchestrator 的 createAbortWatch——模块私有无法 import，本地同口径固化）。
- */
-function createAbortWatch(signal?: AbortSignal): {
-	promise: Promise<typeof ABORTED>;
-	dispose: () => void;
-} {
-	let resolveAbort!: (value: typeof ABORTED) => void;
-	const promise = new Promise<typeof ABORTED>((resolve) => {
-		resolveAbort = resolve;
-	});
-	const onAbort = (): void => resolveAbort(ABORTED);
-	if (signal?.aborted) onAbort(); // 已中止：立即 settle（尝试间检查点兜底）
-	signal?.addEventListener("abort", onAbort, { once: true });
-	return {
-		promise,
-		dispose: () => signal?.removeEventListener("abort", onAbort),
-	};
 }
 
 /**
