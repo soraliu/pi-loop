@@ -1,0 +1,24 @@
+{
+  "name": "pi-loop",
+  "version": "0.1.0",
+  "description": "Loop Engineering 引擎 —— pi extension：自主设计研究方法、调度 subagents、迭代优化结果",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "smoke": "bash scripts/smoke.sh"
+  },
+  "devDependencies": {
+    "@sinclair/typebox": "^0.34.0",
+    "@types/node": "^20.19.43",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

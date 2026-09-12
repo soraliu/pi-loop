@@ -4,3 +4,4 @@ dist/
 .pi-loop-test/
 .DS_Store
 .superpowers/
+coverage/
