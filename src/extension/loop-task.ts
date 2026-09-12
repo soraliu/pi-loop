@@ -39,6 +39,7 @@ import type {
   LoopToolParams,
   LoopToolResult,
   RunPlanInfo,
+  RunTelemetry,
 } from "../types.ts";
 
 /** 解析数据根目录：环境变量 PI_LOOP_DATA_DIR 优先（冒烟/测试注入用），缺省 ~/.pi/loop/ */
@@ -213,7 +214,9 @@ function markRunFailedInRunJson(
  * budget_exhausted/failed 如实；evaluation 摘要（verdict+score+轮数）。遥测口径：
  * succeeded/failed 按末轮分轮切片（entries 的 round 标注）报真值，iterations 报
  * 累计（RunTelemetry 的「run.json iterations 数组长度」口径），durationMs 报闭环
- * 总墙钟（含 designer/评估等待）。错误优先级沿用 M2 语义：pi-subagents 缺席标记
+ * 总墙钟（含 designer/评估等待），agents 报全部轮次 entry 的 agent 去重计数
+ * （M4-T3——与 run.json 的 RunRecord.telemetry 同口径，无执行事实不落键）。
+ * 错误优先级沿用 M2 语义：pi-subagents 缺席标记
  * → 安装引导与运行级文案并列；否则运行级镜像（迭代预算文案 / aborted / 预算拒绝原文）
  */
 function buildIteratedResult(
@@ -248,6 +251,19 @@ function buildIteratedResult(
   const stepFailures = lastEntries
     .filter((e) => e.status === "failed" && e.error !== undefined)
     .map((e) => e.error as string);
+  // agents（M4-T3）：真实 spawn 过的不同 agent 计数——全部轮次 entry 的 agent
+  // 去重，与 run.json 的 RunRecord.telemetry 同口径；零执行事实时不落键（诚实
+  // 遥测：无 spawn 的路径不写假 0）
+  const agents = new Set(runOutcome.iterations.map((entry) => entry.agent))
+    .size;
+  const telemetry: RunTelemetry = {
+    steps: runOutcome.steps,
+    succeeded,
+    failed,
+    iterations: runOutcome.iterations.length,
+    durationMs: wallMs,
+  };
+  if (agents >= 1) telemetry.agents = agents;
   let error = iteration.error;
   if (!completed && stepFailures.some((m) => m.includes(RPC_ABSENT_MARK))) {
     error =
@@ -260,13 +276,7 @@ function buildIteratedResult(
     runId: prep.record.id,
     effort: prep.record.effort,
     preset: prep.preset,
-    telemetry: {
-      steps: runOutcome.steps,
-      succeeded,
-      failed,
-      iterations: runOutcome.iterations.length,
-      durationMs: wallMs,
-    },
+    telemetry,
     plan: iteration.plan,
     evaluation: {
       verdict: evaluation.verdict,
