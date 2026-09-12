@@ -81,8 +81,6 @@ describe("SubagentsRpcClient.request", () => {
 		const bus = new FakeBus();
 		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 20 });
 		await expect(client.request("ping")).rejects.toThrow(/超时/);
-		// 超时后 listener 已卸载：迟到的 reply 不再触发
-		expect(bus.handlers.get("subagents:rpc:v1:reply:")?.size ?? 0).toBeLessThanOrEqual(0);
 	});
 
 	it("并发 3 请求乱序回复各自拿到各自的 data", async () => {

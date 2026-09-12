@@ -64,7 +64,7 @@ export interface LoopToolResult {
 	summary?: string;
 }
 
-/** Run 的只读摘要（/loop-status 列表与 M2 调度内核使用） */
+/** Run 的只读摘要（/loop-status 列表与调度内核使用） */
 export interface RunSummary {
 	/** run id（如 r-abcdef123） */
 	id: string;
@@ -80,4 +80,47 @@ export interface RunSummary {
 export interface LoopSettings {
 	/** 激进度预设表（与默认表深合并后的结果） */
 	effortPresets: EffortPresetsMap;
+}
+
+/* ================================================================
+ * 研究计划与迭代（M2-T2：静态计划 + 编译器的类型基础）
+ * ================================================================ */
+
+/** 研究计划的单个步骤（M3 的 Designer 将动态生成；M2 由 BUILTIN_PLAN 静态提供） */
+export interface PlanStep {
+	/** 步骤唯一 id（计划内；也用作 workflowScript 的 runs.run key） */
+	id: string;
+	/** 执行本步的 subagent 角色名（如 researcher） */
+	agent: string;
+	/** 本步的任务提示词全文 */
+	task: string;
+	/** 前置步骤 id 列表（空数组 = 无依赖，可并行起点） */
+	dependsOn: string[];
+	/** 模型覆盖（M2 全部省略——spawn 一律继承会话默认模型） */
+	model?: string;
+}
+
+/** 研究计划：步骤的 DAG（M2 由 BUILTIN_PLAN 静态构造，M3 由 Designer 动态生成） */
+export interface PlanDraft {
+	steps: PlanStep[];
+}
+
+/**
+ * 单个计划步骤的执行记录（RunRecord.iterations 的元素）。
+ * 生命周期：pending → running → succeeded | failed
+ */
+export interface IterationEntry {
+	/** 对应的 PlanStep.id */
+	stepId: string;
+	/** 执行角色（冗余自 PlanStep.agent，便于 run.json 单文件审计） */
+	agent: string;
+	status: "pending" | "running" | "succeeded" | "failed";
+	/** 输出物引用（M2+ 由调度层填：transcript/run 产物路径） */
+	outputRef?: string;
+	/** ISO 8601 */
+	startedAt?: string;
+	/** ISO 8601 */
+	endedAt?: string;
+	/** 失败原因（status=failed 时） */
+	error?: string;
 }
