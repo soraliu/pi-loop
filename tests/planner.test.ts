@@ -191,12 +191,17 @@ describe("compileWorkflowScript — 负例", () => {
 		expect(() => compileWorkflowScript(plan)).toThrow(/不存在的步骤 "ghost"/);
 	});
 
-	it("dependsOn 重复项 → 保守报环（防回归锁定：计数式 Kahn 对重复依赖项的既有行为）", () => {
+	it("dependsOn 重复项（[a, a] 无环）→ 放行并正常编译（Controller ruling：去重计数语义）", () => {
 		const plan: PlanDraft = {
 			steps: [step({ id: "a" }), step({ id: "b", dependsOn: ["a", "a"] })],
 		};
-		// 已预先接受的行为：重复依赖项使入度清零失败 → 报环拒绝而非产出坏脚本
-		expect(() => compileWorkflowScript(plan)).toThrow(/依赖环/);
+		// M3-T3 Controller ruling：重复依赖项 = "依赖 a"的无害冗余——与 plan-schema
+		// 的去重计数语义（I-1 修复）统一（schema 放行的形状，编译/执行层不得拒绝）；
+		// 本用例反转 M2 时代的保守报环锁定（负例 → 正例，防回归方向反转）
+		const script = compileWorkflowScript(plan);
+		expect(script).toContain('await runs.run("a"');
+		expect(script).toContain('await runs.run("b"');
+		expect(script).toContain('"b": s_b');
 	});
 
 	it("空计划 → 抛错", () => {
