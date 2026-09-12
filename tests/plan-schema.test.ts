@@ -119,22 +119,30 @@ describe("validateResearchPlan — 正例", () => {
 });
 
 describe("原型污染防御", () => {
-	it("三键攻击样例（任务书原样）→ 拒收且 Object.prototype 未被污染", () => {
-		// 必须用 JSON 文本构造：对象字面量的 __proto__ 是设置原型而非自有键
-		const attack = JSON.stringify({
-			steps: [
-				{
-					id: "x",
-					task: "y",
-					dependsOn: [],
-					__proto__: { polluted: "evil" },
-				},
-			],
-		});
-		const result = validateResearchPlan(attack, 5);
-		expect(result.ok).toBe(false); // 缺 version/task/agent/origin 等必填字段 → 拒收
+	it("JSON 文本直传 __proto__ 攻击（顶层 + step 级）→ 净化剔除且各层原型干净", () => {
+		// 攻击串必须手写 JSON 文本：对象字面量的 __proto__ 设的是原型而非自有键，
+		// JSON.stringify 只序列化自有键——经字面量构造会得到不含危险键的恒真样例。
+		// JSON.parse 产物中 "__proto__" 为自有键（不触发 setter），是真实攻击载荷。
+		const attack =
+			'{"__proto__":{"polluted":"evil"},' +
+			'"version":1,"task":"污染测试","origin":"designer",' +
+			'"steps":[{"id":"x","agent":"researcher","task":"t","dependsOn":[],' +
+			'"__proto__":{"polluted":"evil"}}]}';
+		const sanitized = sanitizePlanJson(attack, 5);
+		expect(sanitized.ok).toBe(true);
+		if (!sanitized.ok) return;
+		// 顶层：危险自有键已剔除，原型仍是 Object.prototype（未被改写）
+		expect(ownKeys(sanitized.value)).not.toContain("__proto__");
+		expect(Object.getPrototypeOf(sanitized.value)).toBe(Object.prototype);
+		// step 级：__proto__ 不能经净化路径变为自有键/改原型
+		const steps = probe(sanitized.value).steps as JsonRecord[];
+		expect(steps).toHaveLength(1);
+		expect(ownKeys(steps[0])).not.toContain("__proto__");
+		expect(Object.getPrototypeOf(steps[0])).toBe(Object.prototype);
+		// Object.prototype 全局未被污染；整份计划（净化后）照常过校验
 		const fresh: Record<string, unknown> = {};
-		expect(fresh.polluted).toBeUndefined(); // 原型未被污染
+		expect(fresh.polluted).toBeUndefined();
+		expect(validateResearchPlan(attack, 5).ok).toBe(true);
 	});
 
 	it("合法计划携带三个危险键（顶层/步骤/嵌套数组内）→ 过检且输出无危险键、全局原型干净", () => {
@@ -287,6 +295,12 @@ describe("validateResearchPlan — 负例", () => {
 		expect(joined).toContain("存在依赖环");
 		expect(joined).toContain('"a"');
 		expect(joined).toContain('"b"');
+	});
+
+	it("重复依赖项（b dependsOn [a,a]）但无环 → 放行（入度按去重集合计数）", () => {
+		// 防回归（I-1）：按出现次数计数的实现会把该合法 DAG 误报为环
+		const result = validateResearchPlan(twoStepPlan([], ["a", "a"]), 5);
+		expect(result.ok).toBe(true);
 	});
 
 	it("dependsOn 引用不存在的步骤 id", () => {

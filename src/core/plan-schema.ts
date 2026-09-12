@@ -240,12 +240,17 @@ function fieldPath(path: string): string {
 		.replace(/^\./, "");
 }
 
-/** Kahn 拓扑剥离：返回依赖环涉及的全部节点 id（空数组 = 无环） */
+/**
+ * Kahn 拓扑剥离：无环返回空数组；有环时返回全部入度未清零的节点 id
+ * （环上节点 + 被环阻塞的下游步骤）。计数与递减统一按去重依赖集合：
+ * new Set(dependsOn) 计数、includes 写法每 (step, id) 递减至多一次——
+ * 重复依赖项（如 ["b","b"]，合法形状，schema 放行）不得使入度残留误报环。
+ */
 function findCycleNodeIds(plan: ResearchPlan): string[] {
 	const indegree = new Map<string, number>();
 	for (const step of plan.steps) indegree.set(step.id, 0);
 	for (const step of plan.steps) {
-		for (const _dep of step.dependsOn) {
+		for (const _dep of new Set(step.dependsOn)) {
 			indegree.set(step.id, (indegree.get(step.id) ?? 0) + 1);
 		}
 	}
@@ -323,7 +328,8 @@ export function validateResearchPlan(
 			}
 		}
 	}
-	// 依赖环（Kahn 剥不完即有环，环上节点全部点名；id 加引号与其他错误点名格式统一）
+	// 依赖环（Kahn 剥不完即有环；点名全部入度未清零的步骤，含被环阻塞的下游——
+	// 与 findCycleNodeIds 文档一致；id 加引号与其他错误点名格式统一）
 	const cycleNodes = findCycleNodeIds(plan);
 	if (cycleNodes.length > 0) {
 		errors.push(
