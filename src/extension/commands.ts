@@ -8,7 +8,7 @@ import * as path from "node:path";
 import type { CommandContext, PiExtensionApi } from "./api.ts";
 import { resolveDataDir, runLoopTaskStub } from "./loop-task.ts";
 import { isEffortLevel } from "../storage/settings.ts";
-import type { EffortLevel, LoopToolParams } from "../types.ts";
+import type { EffortLevel, LoopToolParams, RunSummary } from "../types.ts";
 
 /** /loop 参数的解析结果 */
 export interface ParsedLoopArgs {
@@ -89,23 +89,15 @@ export function parseLoopArgs(raw: string): ParsedLoopArgs {
   return result;
 }
 
-/** /loop-status：读取全部 run.json 摘要（最近在前，调用方截取展示条数） */
-export function listRecentRuns(dataDir: string): Array<{
-  id: string;
-  status: string;
-  effort: string;
-  taskPreview: string;
-  createdAt: string;
-}> {
+/**
+ * /loop-status：读取全部 run.json 摘要（最近在前，调用方截取展示条数）。
+ * 宽容读取：JSON 损坏或关键字段（status/effort）非法的记录跳过不展示，
+ * 次要字段（taskPreview/createdAt）缺失时占位，不中断列表。
+ */
+export function listRecentRuns(dataDir: string): RunSummary[] {
   const runsDir = path.join(dataDir, "runs");
   if (!fs.existsSync(runsDir)) return [];
-  const out: Array<{
-    id: string;
-    status: string;
-    effort: string;
-    taskPreview: string;
-    createdAt: string;
-  }> = [];
+  const out: RunSummary[] = [];
   for (const entry of fs.readdirSync(runsDir)) {
     const file = path.join(runsDir, entry, "run.json");
     if (!fs.existsSync(file)) continue;
@@ -117,10 +109,12 @@ export function listRecentRuns(dataDir: string): Array<{
         taskPreview?: string;
         createdAt?: string;
       };
+      // 字段级损坏与 JSON 级损坏同语义：跳过该记录，不用 "unknown" 占位伪装
+      if (record.status === undefined || !isEffortLevel(record.effort)) continue;
       out.push({
         id: record.id ?? entry,
-        status: record.status ?? "unknown",
-        effort: record.effort ?? "unknown",
+        status: record.status as RunSummary["status"],
+        effort: record.effort,
         taskPreview: record.taskPreview ?? "(无预览)",
         createdAt: record.createdAt ?? "",
       });

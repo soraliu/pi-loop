@@ -220,7 +220,10 @@ describe("runLoopTaskStub 共享核心", () => {
       expect(result.preset.maxParallelSubagents).toBe(4);
       // run.json 同盘，磁盘与返回一致
       const record = JSON.parse(
-        fs.readFileSync(path.join(tmp, "runs", result.runId, "run.json"), "utf8"),
+        fs.readFileSync(
+          path.join(tmp, "runs", result.runId, "run.json"),
+          "utf8",
+        ),
       ) as { effort: string };
       expect(record.effort).toBe("medium");
     } finally {
@@ -283,7 +286,7 @@ describe("/loop 命令 handler", () => {
       // 磁盘核验：runs 目录下确有对应记录
       const runs = listRecentRuns(tmp);
       expect(runs).toHaveLength(1);
-      expect(runs[0].effort ?? "low").toBe("low");
+      expect(runs[0].effort).toBe("low");
     } finally {
       if (prev === undefined) delete process.env.PI_LOOP_DATA_DIR;
       else process.env.PI_LOOP_DATA_DIR = prev;

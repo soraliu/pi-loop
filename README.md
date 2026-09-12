@@ -23,7 +23,9 @@ pi install git:github.com/soraliu/pi-loop
 ```text
 /loop 研究 rust tokio 和 async-std 的调度器差异，产出对比报告     # 交互式启动
 /loop --effort max 写一个 redis 简化版并附基准测试                # 激进迭代
-/loop-status                                                     # 查看运行与案例档案
+/loop-status                                                     # 查看最近运行
+/loop-cases                                                      # 查看案例档案
+/loop-methods                                                    # 查看方法论库
 ```
 
 或在会话中直接对 agent 说"用 loop_task 研究并实现 X"，agent 会调用 `loop_task` 工具。
@@ -32,12 +34,12 @@ pi install git:github.com/soraliu/pi-loop
 
 `/loop --effort low|medium|high|max`，或 `loop_task` 的 `effort` 参数：
 
-| preset | 结果迭代轮数 | 并行 subagents | meta 自迭代 |
+| preset | 结果迭代轮数上限 | 并行 subagents | meta 触发 |
 |---|---|---|---|
-| low | ≤1 | 1-2 | 不自动 |
-| medium | ≤2 | 2-4 | 手动触发 |
-| high | ≤3 | 4-6 | 累计 5 案例后提议 |
-| max | ≤5 | 6-8 | 累积阈值自动提议 |
+| low | 1 | 2 | 关闭 |
+| medium | 2 | 4 | 手动 |
+| high | 3 | 6 | ≥5 新案例提议 |
+| max | 5 | 8 | ≥3 新案例提议 |
 
 ## 开发
 

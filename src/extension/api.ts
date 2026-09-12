@@ -3,7 +3,7 @@
 // 因此这里只声明 pi-loop 实际用到的形状（结构化类型），运行时由 pi 宿主提供真实实现。
 // 依据：pi 官方文档 docs/extensions.md 的 Quick Start 契约原文。
 
-import type { Static, TSchema } from "@sinclair/typebox";
+import type { TSchema } from "@sinclair/typebox";
 
 /** pi 工具向模型返回的标准结构（docs/extensions.md registerTool 契约） */
 export interface ToolResponse {
@@ -67,6 +67,3 @@ export interface PiExtensionApi {
  /** 注册一个 /slash 命令 */
  registerCommand: (name: string, options: CommandOptions) => unknown;
 }
-
-/** 宿主提供的 typebox Schema 静态类型助手（仅用于从 schema 推导参数类型） */
-export type InferParams<T extends TSchema> = Static<T>;

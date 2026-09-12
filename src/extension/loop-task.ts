@@ -2,7 +2,11 @@
 // 工具（loop_task）与命令（/loop）共享同一入口——单一事实源，保证两边行为一致。
 // M2 调度内核接入后，本文件的 stub 实现将被真实执行链替换，函数签名保持稳定。
 
-import { DEFAULT_EFFORT_LEVEL, isEffortLevel, loadLoopSettings } from "../storage/settings.ts";
+import {
+  DEFAULT_EFFORT_LEVEL,
+  isEffortLevel,
+  loadLoopSettings,
+} from "../storage/settings.ts";
 import {
   createRunRecord,
   defaultDataDir,

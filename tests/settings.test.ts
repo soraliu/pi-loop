@@ -15,18 +15,18 @@ import {
 	resolveEffort,
 } from "../src/storage/settings.ts";
 
-/** 建一次性临时目录，测试结束后清理 */
+/** 建一次性临时目录并登记，afterAll 只清理登记项（全局前缀扫描有并发误删风险） */
+const tempDirs: string[] = [];
 function makeTempDir(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-loop-test-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-loop-test-"));
+	tempDirs.push(dir);
+	return dir;
 }
 
 afterAll(() => {
-	// 清理本文件产生的临时目录（mkdtemp 前缀过滤，防误删）
-	const tmp = os.tmpdir();
-	for (const name of fs.readdirSync(tmp)) {
-		if (name.startsWith("pi-loop-test-")) {
-			fs.rmSync(path.join(tmp, name), { recursive: true, force: true });
-		}
+	// 只清理本文件登记的临时目录
+	for (const dir of tempDirs) {
+		fs.rmSync(dir, { recursive: true, force: true });
 	}
 });
 
@@ -81,7 +81,7 @@ describe("resolveEffort", () => {
 			"MAX",
 			42,
 			null,
-			undefined === undefined ? "turbo" : "x",
+			"turbo", // 原 dead-branch 三元已改直接字面量
 		]) {
 			expect(() => resolveEffort(bad as never)).toThrow(TypeError);
 			try {

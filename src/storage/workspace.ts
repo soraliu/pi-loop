@@ -41,7 +41,7 @@ export function taskPreview(taskText: string, maxLength = 80): string {
  * 确保工作区目录结构存在：`<dataDir>/{runs,cases,methods}`。
  * 幂等（目录已存在时不报错）；自动创建缺失的中间目录。
  * @param dataDir 数据根目录；缺省为 ~/.pi/loop/
- * @returns 数据根目录的绝对路径
+ * @returns 传入的数据根目录（原样返回，不另做路径解析）
  */
 export function ensureWorkspace(dataDir: string = defaultDataDir()): string {
 	for (const sub of ["runs", "cases", "methods"]) {
