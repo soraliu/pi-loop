@@ -5,6 +5,8 @@
 
 import type { TSchema } from "@sinclair/typebox";
 
+import type { SubagentEventBus } from "../core/rpc.ts";
+
 /** pi 工具向模型返回的标准结构（docs/extensions.md registerTool 契约） */
 export interface ToolResponse {
  content: Array<{ type: "text"; text: string }>;
@@ -26,17 +28,18 @@ export interface ToolDefinition {
   * @param toolCallId 调用 id（宿主分配）
   * @param params 已通过 schema 校验的入参
   * @param signal 中止信号
-  * @param onUpdate 进度回调（长任务可分段投递）
-  * @param ctx 扩展执行上下文（本扩展 stub 阶段不使用）
+  * @param onUpdate 进度回调（长任务可分段投递；回调签名不变。声明为可选系
+  * M2-T4 的宽容契约：宿主未传时工具内部吞掉，不阻断执行）
+  * @param ctx 扩展执行上下文（本扩展不使用；随 onUpdate 可选化后同步声明为可选）
   */
  execute: (
   toolCallId: string,
   params: unknown,
   signal: AbortSignal,
-  onUpdate: (update: {
+  onUpdate?: (update: {
    content: Array<{ type: "text"; text: string }>;
   }) => void,
-  ctx: unknown,
+  ctx?: unknown,
  ) => Promise<ToolResponse>;
 }
 
@@ -66,4 +69,11 @@ export interface PiExtensionApi {
  registerTool: (definition: ToolDefinition) => unknown;
  /** 注册一个 /slash 命令 */
  registerCommand: (name: string, options: CommandOptions) => unknown;
+ /**
+  * 扩展事件总线（宿主提供；M2-T4 引入）。pi-loop 经它驱动 pi-subagents 的
+  * in-process RPC（subagents:rpc:v1:* 事件）；形状与 src/core/rpc.ts 的
+  * SubagentEventBus 同一（单一拼写，不引入宿主类型包）。缺省无总线时调度以
+  * 超时失败收尾（LoopToolResult 附 pi-subagents 安装引导）。
+  */
+ events?: SubagentEventBus;
 }

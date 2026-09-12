@@ -41,10 +41,17 @@ export interface LoopToolParams {
 	contextPaths?: string[];
 }
 
-/** Run 遥测（M2+ 由 Orchestrator 填充；stub 阶段为全零占位） */
+/** Run 遥测（M2-T4 起由调度内核 RunOutcome 填充；stub 路径为全零占位） */
 export interface RunTelemetry {
-	agents: number;
-	turns: number;
+	/** 计划步骤总数 */
+	steps: number;
+	/** 成功步骤数 */
+	succeeded: number;
+	/** 失败步骤数 */
+	failed: number;
+	/** iteration 条目数（子代理实际调度次数，即 run.json iterations 数组长度） */
+	iterations: number;
+	/** 调度核心耗时（毫秒） */
 	durationMs: number;
 }
 
@@ -58,10 +65,12 @@ export interface LoopToolResult {
 	effort: EffortLevel;
 	/** 生效预设快照（便于审计"当时允许了几轮迭代"） */
 	preset: EffortPreset;
-	/** 遥测占位 */
+	/** 遥测（真实调度路径按 RunOutcome 填充；stub 为全零） */
 	telemetry: RunTelemetry;
-	/** 人类可读结果摘要（M2+ 填充） */
+	/** 人类可读结果摘要 */
 	summary?: string;
+	/** 失败原因（status=failed 时给可操作信息，如 pi-subagents 安装引导；中止记 "aborted"） */
+	error?: string;
 }
 
 /** Run 的只读摘要（/loop-status 列表与调度内核使用） */

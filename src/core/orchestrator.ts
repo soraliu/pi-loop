@@ -97,8 +97,15 @@ function runJsonPath(dataDir: string, runId: string): string {
 	return path.join(dataDir, "runs", runId, "run.json");
 }
 
-/** 读取现有 run 记录；不存在 / 损坏 / 缺 iterations 数组都是错误（调用方负责呈现） */
-function loadRunRecord(dataDir: string, runId: string): RunRecord {
+/**
+ * 读取现有 run 记录；不存在 / 损坏 / 缺 iterations 数组都是错误（调用方负责呈现）。
+ * 返回类型附加 run 级 error 可选字段——abort 落痕（T4 收口，T3 review M1）：
+ * 层间检查点中止时不产生任何 entry，run 级 error 是该次中止除 status=failed 外的唯一痕迹。
+ */
+function loadRunRecord(
+	dataDir: string,
+	runId: string,
+): RunRecord & { error?: string } {
 	const file = runJsonPath(dataDir, runId);
 	if (!fs.existsSync(file)) {
 		throw new Error(
@@ -118,7 +125,7 @@ function loadRunRecord(dataDir: string, runId: string): RunRecord {
 	) {
 		throw new Error(`run 记录结构非法（缺 iterations 数组）：${file}`);
 	}
-	return parsed as RunRecord;
+	return parsed as RunRecord & { error?: string };
 }
 
 /**
@@ -412,6 +419,8 @@ export async function executePlan(
 	} finally {
 		abortWatch.dispose();
 		record.status = planFailed ? "failed" : "completed";
+		// abort 落痕（T4 收口）：因中止而失败的 run 在 run 级也记 error="aborted"
+		if (planFailed && ctx.signal?.aborted) record.error = "aborted";
 		saveRecord();
 	}
 

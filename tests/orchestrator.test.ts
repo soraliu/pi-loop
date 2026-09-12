@@ -59,6 +59,8 @@ function readRecord(
 	runId: string,
 ): {
 	status: string;
+	/** T4 abort 落痕：run 级 error 字段（中止时的可审计痕迹） */
+	error?: string;
 	iterations: Array<{
 		stepId: string;
 		agent: string;
@@ -372,6 +374,9 @@ describe("executePlan — 失败路径", () => {
 		expect(fake.stopCalls).toEqual(fake.spawns.map((s) => s.runId));
 		const final = readRecord(dataDir, runId);
 		expect(final.status).toBe("failed");
+		// T4 收口（T3 review M1）：中止在 run 级也留痕——error="aborted"
+		// （层间检查点中止时不产生任何 entry，run 级 error 是唯一痕迹）
+		expect(final.error).toBe("aborted");
 		expect(final.iterations).toHaveLength(2); // a 未执行
 		for (const entry of final.iterations) {
 			expect(entry.status).toBe("failed");
