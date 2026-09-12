@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { PlanUpdate } from "../src/core/orchestrator.ts";
+import type { PlanUpdate, RunOutcome } from "../src/core/orchestrator.ts";
 import type { SubagentEventBus } from "../src/core/rpc.ts";
 import type {
   CommandContext,
@@ -29,9 +29,10 @@ import {
 } from "../src/extension/loop-task.ts";
 import type { LoopToolResult } from "../src/types.ts";
 
-// ---------- executePlan 的 budget 注入捕获（M3-T5：M-1 收口） ----------
+// ---------- executePlan 的 budget 注入捕获（M3-T5：M-1 收口）与返回形注入（M4-T0） ----------
 // vi.mock 对整个文件生效：wrapper 透传实际实现（既有用例零影响），只旁路记录
-// runLoopTask → executePlan 的 ctx.budget——T4 报告申报的捕获型断言在此兑现。
+// runLoopTask → executePlan 的 ctx.budget——T4 报告申报的捕获型断言在此兑现；
+// M4-T0 另增 outcomeOverrides 返回形注入队列（预算拒绝形态的 tool 层枚举映射用例）。
 // vi.mock 工厂会被提升到文件顶部，引用的变量必须经 vi.hoisted 同样提升
 const budgetCaptures = vi.hoisted(
   () =>
@@ -39,6 +40,8 @@ const budgetCaptures = vi.hoisted(
       { maxPlanSteps: number; maxParallelSubagents: number } | undefined
     >,
 );
+/** executePlan 的返回形注入队列（非空时按序消费其一，绕过真实调度；空则透传真实现） */
+const outcomeOverrides = vi.hoisted(() => [] as RunOutcome[]);
 vi.mock("../src/core/orchestrator.ts", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../src/core/orchestrator.ts")>();
@@ -49,7 +52,26 @@ vi.mock("../src/core/orchestrator.ts", async (importOriginal) => {
       ctx: Parameters<typeof actual.executePlan>[1],
     ) => {
       budgetCaptures.push(ctx.budget);
+      const override = outcomeOverrides.shift();
+      if (override !== undefined) return Promise.resolve(override);
       return actual.executePlan(plan, ctx);
+    },
+  };
+});
+
+// ---------- generatePlan 的异常注入（M4-T0：run.json 悬留收口用例） ----------
+// 缺省透传真实现（既有用例零影响）；designerFailures 非空时按序消费其一作为
+// generatePlan 的拒绝原因——真实实现的降级路径不抛业务异常，此处模拟 fs 类基建故障
+const designerFailures = vi.hoisted(() => [] as Error[]);
+vi.mock("../src/core/designer.ts", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/core/designer.ts")>();
+  return {
+    ...actual,
+    generatePlan: (...args: Parameters<typeof actual.generatePlan>) => {
+      const failure = designerFailures.shift();
+      if (failure !== undefined) return Promise.reject(failure);
+      return actual.generatePlan(...args);
     },
   };
 });
@@ -960,6 +982,84 @@ describe("runLoopTask — designer 成功通道（M3-T5）", () => {
       // 附带锁定注入链头端：preset → designer 任务文本的预算约束行
       expect(designerTaskText).toContain("计划步骤数上限：5 步");
       expect(designerTaskText).toContain("最多 4 个 subagent");
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+});
+
+// ---------- M4-T0：run.json 悬留收口（M3 终审 M-4 债）与 budget_exhausted 枚举映射（M-3 债） ----------
+describe("runLoopTask — 执行链异常的 run.json 悬留收口（M4-T0）", () => {
+  it("designer 基建异常（recordPlanInRunJson 之前抛出）→ run.json 不再悬留 created：落 failed + error 摘要", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      // generatePlan 的基建形态异常（fs 故障类——真实实现的降级路径不产出业务抛出）：
+      // 抛出点在 recordPlanInRunJson 之前，catch 前的 run.json 悬留 status="created"
+      // 正是本债的边缘场景
+      designerFailures.push(new Error("写 designer-plan.json 时磁盘配额已满"));
+      const result = await runLoopTask(
+        { task: "悬留收口任务" },
+        { busEnv: makeFakeSubagentsBus() },
+      );
+      // 统一收敛为 failed 结果（不向宿主抛裸异常）——既有语义保持
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("磁盘配额已满");
+      expect(result.summary).toContain("执行链异常");
+      // M-4 兑底：对照 executePlan 前置失败"先标 failed 再上抛"的治法，悬留的
+      // created 被收口为 failed + error 摘要（审计面不丢）
+      const record = JSON.parse(
+        fs.readFileSync(
+          path.join(tmp, "runs", result.runId, "run.json"),
+          "utf-8",
+        ),
+      ) as { status: string; error?: string };
+      expect(record.status).toBe("failed");
+      expect(record.error).toContain("磁盘配额已满");
+      // designer 前抛 → 计划摘要尚未成形（plan 字段缺省）
+      expect(result.plan).toBeUndefined();
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+});
+
+describe("runLoopTask — 预算拒绝的枚举映射（M4-T0，终审 M-3 债）", () => {
+  it("executePlan 预算拒绝返回形（error 前缀 budget_exhausted:）→ status=budget_exhausted 而非裸 failed", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      // executePlan 预算拒绝的返回形（orchestrator 侧 M3-T3 用例已锁定：零 spawn、
+      // 零 entry、run 级 error 带 budget_exhausted: 前缀）——注入该形锁定 tool 层映射；
+      // run.json 断言不作（override 绕过了真实 executePlan 的落盘）
+      outcomeOverrides.push({
+        steps: 3,
+        succeeded: 0,
+        failed: 0,
+        durationMs: 4,
+        iterations: [],
+        batches: 0,
+        error: "budget_exhausted: plan steps 3 > max 2",
+      });
+      const result = await runLoopTask(
+        { task: "预算拒绝映射任务" },
+        {
+          busEnv: makeFakeSubagentsBus({ mode: "silent" }),
+          rpcTimeoutMs: 25, // spawn 受理快速走完缺席降级（designer 侧不影响 override）
+        },
+      );
+      // SPEC §7.3"超界立即收尾并如实报告 budget_exhausted"——枚举不再只是摆设
+      expect(result.status).toBe("budget_exhausted");
+      expect(result.error).toBe("budget_exhausted: plan steps 3 > max 2");
+      expect(result.summary).toContain("预算耗尽");
+      // 遥测按 outcome 落真值（3 步计划、零执行、零迭代）
+      expect(result.telemetry).toEqual({
+        steps: 3,
+        succeeded: 0,
+        failed: 0,
+        iterations: 0,
+        durationMs: 4,
+      });
     } finally {
       restoreEnv(saved);
     }

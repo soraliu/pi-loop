@@ -21,6 +21,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import {
+	ABORTED,
+	COMPLETION_TIMEOUT_MS,
+	STOP_TIMEOUT_MS,
+	createAbortWatch,
+} from "./consts.ts";
 import { topoLayers } from "./dag.ts";
 import type { SubagentsRpcClient } from "./rpc.ts";
 import type { RunRecord } from "../storage/workspace.ts";
@@ -93,14 +99,9 @@ export interface RunOutcome {
 	error?: string;
 }
 
-/** 单步完成等待超时上限：真实研究 agent 可跑数分钟，取保守宽裕值（M2 固定；M4 再与 effort 档位挂钩） */
-const STEP_COMPLETION_TIMEOUT_MS = 10 * 60_000;
-
-/** abort 收尾时 stop 的等待上界：超时即放弃 stop 确认（不阻断整体失败收尾） */
-const STOP_TIMEOUT_MS = 10_000;
-
-/** abort 竞速哨兵：完成 payload 是对象或 null，Symbol 保证不与之混淆 */
-const ABORTED = Symbol("pi-loop:aborted");
+// 完成等待 / 收尾超时与 abortWatch 自 M4-T0 起收敛于 ./consts.ts（M3 终审 M-5 债：
+// 常量值不变只是搬家——waitForCompletion 的 timeoutMs 断言锁定的仍是同值 10 分钟，
+// 与 designer 共享单一真源，命名统一为 COMPLETION_TIMEOUT_MS——spawn 等待本无步语义）。
 
 /**
  * spawn 失败的「超时/无应答」特征判定（M-1，M2 终审收口）：pi-subagents 缺席的
@@ -122,26 +123,6 @@ export function isNoReplyTimeout(error: unknown): boolean {
 	if (code === "timeout") return true;
 	const message = error instanceof Error ? error.message : String(error);
 	return message.includes("无 reply") || message.includes("超时");
-}
-
-/** signal → 一次性 settle 的"已中止"哨兵 promise（竞速的从方） */
-interface AbortWatch {
-	promise: Promise<typeof ABORTED>;
-	dispose: () => void;
-}
-
-function createAbortWatch(signal?: AbortSignal): AbortWatch {
-	let resolveAbort!: (value: typeof ABORTED) => void;
-	const promise = new Promise<typeof ABORTED>((resolve) => {
-		resolveAbort = resolve;
-	});
-	const onAbort = (): void => resolveAbort(ABORTED);
-	if (signal?.aborted) onAbort(); // 已中止：立即 settle（层开始与 spawn 前的检查点兜底）
-	signal?.addEventListener("abort", onAbort, { once: true });
-	return {
-		promise,
-		dispose: () => signal?.removeEventListener("abort", onAbort),
-	};
 }
 
 /** run.json 路径（与 storage/workspace.createRunRecord 同构：<dataDir>/runs/<id>/run.json） */
@@ -448,7 +429,7 @@ export async function executePlan(
 		let completion: unknown;
 		try {
 			completion = await Promise.race([
-				ctx.rpc.waitForCompletion(runId, STEP_COMPLETION_TIMEOUT_MS),
+				ctx.rpc.waitForCompletion(runId, COMPLETION_TIMEOUT_MS),
 				abortWatch.promise,
 			]);
 		} catch (error) {
@@ -466,7 +447,7 @@ export async function executePlan(
 			return failEntry(
 				entry,
 				step,
-				`等待完成超时（${STEP_COMPLETION_TIMEOUT_MS}ms 内无匹配 async-complete 事件）`,
+				`等待完成超时（${COMPLETION_TIMEOUT_MS}ms 内无匹配 async-complete 事件）`,
 			);
 		}
 		const reading = readCompletion(completion);

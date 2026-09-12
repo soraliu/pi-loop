@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { COMPLETION_TIMEOUT_MS } from "../src/core/consts.ts";
 import { executePlan, type PlanUpdate } from "../src/core/orchestrator.ts";
 import { BUILTIN_PLAN } from "../src/core/planner-static.ts";
 import type { PlanDraft } from "../src/types.ts";
@@ -534,6 +535,21 @@ describe("executePlan — BUILTIN_PLAN 单步最小路径（T4 直连口径）",
 			failed: 0,
 			durationMs: expect.any(Number),
 		});
+	});
+
+	it("完成等待口径锁定：以 consts.COMPLETION_TIMEOUT_MS（10 分钟）等待——与 designer 共享单一真源（M4-T0，M-5 债收敛）", async () => {
+		const { dataDir, runId } = setupRun("完成等待口径对账");
+		const fake = new FakeRpc().script("researcher", {});
+		await executePlan(BUILTIN_PLAN("完成等待口径对账"), {
+			rpc: fake,
+			runId,
+			dataDir,
+		});
+		// 常量搬家（本地固化 → consts 导出）后的零回归锚点：等待值与 designer 同源同值
+		expect(fake.waits).toEqual([
+			{ runId: fake.spawns[0].runId, timeoutMs: COMPLETION_TIMEOUT_MS },
+		]);
+		expect(COMPLETION_TIMEOUT_MS).toBe(10 * 60_000);
 	});
 
 	it("完成 payload 经 results[0] 携带产物引用（真实形 outputReference/artifactPaths）→ outputRef 有效", async () => {

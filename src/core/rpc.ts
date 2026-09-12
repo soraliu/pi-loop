@@ -74,8 +74,9 @@ function extractRunId(payload: unknown): string | undefined {
 	return undefined;
 }
 
-/** 受理头 runId 提取正则（宿主受理 text 首行："Async: <agent> [<runId>]"） */
-const ASYNC_HEADER_RUN_ID_RE = /Async: \S+ \[([^\]]+)\]/;
+/** 受理头 runId 提取正则（宿主受理 text 首行："Async: <agent> [<runId>]"——^ 锚定首行语义，
+ *  正文中间出现的 "Async: …" 只是文字内容不作受理头；M4-T0 补锚，M3 终审 M-2 债） */
+const ASYNC_HEADER_RUN_ID_RE = /^Async: \S+ \[([^\]]+)\]/;
 
 /** 非空字符串判定（受理 runId 候选的统一形状校验） */
 function isNonEmptyString(value: unknown): value is string {

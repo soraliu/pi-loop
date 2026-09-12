@@ -1,4 +1,5 @@
-// loop_task 的执行核心（M1-T4 stub → M2-T4 真实调度内核接入 → M3-T4 designer 接线）
+// loop_task 的执行核心（M1-T4 stub → M2-T4 真实调度内核接入 → M3-T4 designer 接线
+// → M4-T0 债务收口：run.json 悬留兜底 + budget_exhausted 枚举映射）
 // 工具（loop_task）与命令（/loop）共享同一入口——单一事实源，保证两边行为一致。
 // 双行为分派：PI_LOOP_STUB=1 保留 M1 stub 语义（冒烟/降级/回归）；缺省走真实调度——
 // 三步链（配置快照 → 建工作区 → 落 run.json）之后构造 SubagentsRpcClient，先经
@@ -174,6 +175,35 @@ function recordPlanInRunJson(
   fs.writeFileSync(file, JSON.stringify(record, null, "\t") + "\n");
 }
 
+/**
+ * run.json 悬留收口（M4-T0，M3 终审 M-4 债）：runLoopTask 的 catch 意味着异常发生在
+ * executePlan 无法保证落盘的位置（designer 基建异常 / recordPlanInRunJson 读写失败 /
+ * executePlan 受理前的上抛）——run 记录可能悬留非终态（status=created）。对照
+ * executePlan 前置失败「先标 failed 再上抛」的既有治法，以同样的落盘格式（读改写、
+ * 磁盘为事实源）补齐：只收口非终态（created/running——executePlan 已自标 failed 的
+ * 路径不覆盖），error 字段落异常摘要供审计。兜底自身的失败（run.json 损坏/不可写）
+ * 静默吞掉——绝不掩盖原异常。
+ */
+function markRunFailedInRunJson(
+  dataDir: string,
+  runId: string,
+  message: string,
+): void {
+  try {
+    const file = path.join(dataDir, "runs", runId, "run.json");
+    if (!fs.existsSync(file)) return;
+    const record = JSON.parse(fs.readFileSync(file, "utf-8")) as RunRecord & {
+      error?: string;
+    };
+    if (record.status !== "created" && record.status !== "running") return;
+    record.status = "failed";
+    record.error = message;
+    fs.writeFileSync(file, JSON.stringify(record, null, "\t") + "\n");
+  } catch {
+    // 收口失败（run.json 缺席/损坏/不可写）不掩盖原异常——原异常才是调用方要呈现的
+  }
+}
+
 /** 真实路径的 LoopToolResult 构造：遥测/迭代数按 RunOutcome 落真值，失败附可读原因 */
 function buildRealResult(
   prep: PreparedRun,
@@ -181,6 +211,12 @@ function buildRealResult(
   planSummary?: LoopPlanBrief,
 ): LoopToolResult {
   const completed = outcome.failed === 0 && outcome.succeeded === outcome.steps;
+  // 预算拒绝映射（M4-T0，终审 M-3 债）：outcome.error 带 "budget_exhausted:" 前缀
+  // （executePlan 预算拒绝路径的返回形——零 spawn、零 entry）→ status 如实取
+  // budget_exhausted 而非裸 failed（SPEC §7.3：超界立即收尾并如实报告）
+  const budgetExhausted =
+    outcome.error !== undefined &&
+    outcome.error.startsWith("budget_exhausted:");
   const failures = outcome.iterations
     .filter((entry) => entry.status === "failed")
     .map((entry) => entry.error)
@@ -191,7 +227,11 @@ function buildRealResult(
     ? RPC_INSTALL_GUIDANCE
     : (failures[0] ?? outcome.error);
   const result: LoopToolResult = {
-    status: completed ? "completed" : "failed",
+    status: completed
+      ? "completed"
+      : budgetExhausted
+        ? "budget_exhausted"
+        : "failed",
     runId: prep.record.id,
     effort: prep.record.effort,
     preset: prep.preset,
@@ -204,7 +244,9 @@ function buildRealResult(
     },
     summary: completed
       ? `任务完成：${outcome.succeeded}/${outcome.steps} 步成功，耗时 ${outcome.durationMs}ms`
-      : `任务失败：${outcome.failed} 步未通过，耗时 ${outcome.durationMs}ms（详情见 run.json）`,
+      : budgetExhausted
+        ? `任务因预算耗尽终止：计划 ${outcome.steps} 步超出允许上限（详情见 run.json）`
+        : `任务失败：${outcome.failed} 步未通过，耗时 ${outcome.durationMs}ms（详情见 run.json）`,
     ...(planSummary === undefined ? {} : { plan: planSummary }),
   };
   if (error !== undefined) result.error = error;
@@ -270,6 +312,10 @@ export async function runLoopTask(
     // 类异常——executePlan 已把 run 标 failed 后上抛）：统一收敛为 failed 结果，
     // 错误详情仍可经 error 字段与 run.json 审计，不向宿主抛裸异常
     const message = error instanceof Error ? error.message : String(error);
+    // M-4 债兜底（M3 终审）：异常发生在 executePlan 接管前（designer 抛出 /
+    // recordPlanInRunJson 读写失败）时 run.json 会悬留非终态（created）——对照
+    // executePlan 前置失败「先标 failed 再上抛」的既有治法补齐落盘（终态不覆盖）
+    markRunFailedInRunJson(prep.dataDir, prep.record.id, message);
     const failed: LoopToolResult = {
       status: "failed",
       runId: prep.record.id,
