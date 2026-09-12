@@ -1,18 +1,27 @@
 // pi-loop 静态计划与 workflowScript 编译器（M2-T2）
 // 依据 docs/plans/m2-orchestrator.md T2、docs/SPEC.md §4（Orchestrator 契约）。
 //
-// 职责：把 PlanDraft（步骤 DAG）编译为 pi-subagents 可执行的 workflowScript 字符串。
+// 职责：把 PlanDraft（步骤 DAG 视图）编译为 pi-subagents 可执行的 workflowScript 字符串；
+// 全量计划形状 ResearchPlan（M3-T1）是 PlanDraft 的结构超集，直接可喂。
 // 安全不变式：所有动态值（agent/task）一律 JSON.stringify 后嵌入字符串字面量位置，
 // 使引号/反引号/${}/换行均被转义，调用方注入的文本无法逃逸出字符串字面量。
+// M3-T3：结构校验 + 拓扑分层收敛到共享 util ./dag.ts（唯一真源），本模块只保留
+// 编译器特有的校验（变量名冲突）与产物拼接。
 
-import type { PlanDraft, PlanStep } from "../types.ts";
+import { topoLayers } from "./dag.ts";
+import type { PlanDraft, PlanStep, ResearchPlan } from "../types.ts";
 
 /**
  * 内置"标准研究"静态计划（M2 最小闭环主线）。
- * M3 的 Designer 将以动态生成替代本函数；接口（入参任务全文、出参 PlanDraft）保持不变。
+ * M3 的 Designer 将以动态生成替代本函数；M3-T1 起出参升级为 ResearchPlan
+ * （origin 固定 "builtin"），入参（任务全文）保持不变。compileWorkflowScript
+ * 与 executePlan 按 PlanDraft 视图消费（只读 steps），结构兼容无需调整。
  */
-export function BUILTIN_PLAN(task: string): PlanDraft {
+export function BUILTIN_PLAN(task: string): ResearchPlan {
 	return {
+		version: 1,
+		task,
+		origin: "builtin",
 		steps: [
 			{
 				id: "research",
@@ -24,67 +33,13 @@ export function BUILTIN_PLAN(task: string): PlanDraft {
 	};
 }
 
-/** 编译前校验一：步骤 id 唯一 */
-function assertUniqueIds(steps: PlanStep[]): Map<string, PlanStep> {
-	const byId = new Map<string, PlanStep>();
-	for (const step of steps) {
-		if (byId.has(step.id)) {
-			throw new Error(`计划校验失败：步骤 id 重复 "${step.id}"`);
-		}
-		byId.set(step.id, step);
-	}
-	return byId;
-}
-
-/** 编译前校验二：dependsOn 引用必须存在 */
-function assertKnownDeps(byId: Map<string, PlanStep>): void {
-	for (const step of byId.values()) {
-		for (const dep of step.dependsOn) {
-			if (!byId.has(dep)) {
-				throw new Error(
-					`计划校验失败：步骤 "${step.id}" 依赖不存在的步骤 "${dep}"`,
-				);
-			}
-		}
-	}
-}
-
-/** 编译前校验三：Kahn 环检测（摘不完入度即有环） */
-function assertAcyclic(steps: PlanStep[]): void {
-	const indegree = new Map<string, number>();
-	for (const step of steps) indegree.set(step.id, 0);
-	for (const step of steps) {
-		for (const dep of step.dependsOn) {
-			indegree.set(step.id, (indegree.get(step.id) ?? 0) + 1);
-		}
-	}
-	const queue = steps
-		.filter((s) => (indegree.get(s.id) ?? 0) === 0)
-		.map((s) => s.id);
-	let removed = 0;
-	while (queue.length > 0) {
-		const id = queue.shift() as string;
-		removed++;
-		for (const step of steps) {
-			if (step.dependsOn.includes(id)) {
-				const next = (indegree.get(step.id) ?? 0) - 1;
-				indegree.set(step.id, next);
-				if (next === 0) queue.push(step.id);
-			}
-		}
-	}
-	if (removed !== steps.length) {
-		const cycleNodes = steps
-			.filter((s) => (indegree.get(s.id) ?? 0) > 0)
-			.map((s) => s.id);
-		throw new Error(`计划校验失败：依赖环涉及 ${cycleNodes.join(", ")}`);
-	}
-}
-
 /**
- * 编译前校验四：步骤 id 归一化成 JS 变量名后互不冲突。
+ * 编译前校验（本模块特有）：步骤 id 归一化成 JS 变量名后互不冲突。
  * varName 把非标识符字符替换为下划线（"a-b" 与 "a_b" 都得 s_a_b）——
  * 不拦截会产生 const 重声明，产物即非法脚本。
+ *
+ * 注：空计划 / id 重复 / 幽灵依赖 / 依赖环四类结构校验已收敛到 dag.topoLayers
+ * （M3-T3 单一真源），编译器侧的既有负例用例因此保持绿（契约级断言）。
  */
 function assertDistinctVarNames(steps: PlanStep[]): void {
 	const seen = new Set<string>();
@@ -97,29 +52,6 @@ function assertDistinctVarNames(steps: PlanStep[]): void {
 		}
 		seen.add(v);
 	}
-}
-
-/**
- * 拓扑分层：同一层内的步骤互不依赖，可并行（runs.all）；
- * 层间串行（后层依赖前层的产物）。Kahn 分层实现。
- */
-function topoLayers(plan: PlanDraft): PlanStep[][] {
-	const byId = new Map<string, PlanStep>();
-	for (const step of plan.steps) byId.set(step.id, step);
-	const remaining = new Map(byId);
-	const layers: PlanStep[][] = [];
-	while (remaining.size > 0) {
-		const layer = [...remaining.values()].filter((step) =>
-			step.dependsOn.every((dep) => !remaining.has(dep)),
-		);
-		if (layer.length === 0) {
-			// 理论上 assertAcyclic 已拦截环；此处兜底防御
-			throw new Error("拓扑分层失败：剩余步骤存在未检出的依赖环");
-		}
-		for (const step of layer) remaining.delete(step.id);
-		layers.push(layer);
-	}
-	return layers;
 }
 
 /** 动态值 → 字面量安全嵌入（JSON.stringify 转义引号/反引号/${}/换行） */
@@ -139,14 +71,11 @@ function varName(stepId: string): string {
  *   层间串行 await；`return {...}` 汇总全部步骤结果。
  */
 export function compileWorkflowScript(plan: PlanDraft): string {
-	if (plan.steps.length === 0) {
-		throw new Error("计划校验失败：计划不含任何步骤");
-	}
-	const byId = assertUniqueIds(plan.steps);
-	assertKnownDeps(byId);
-	assertAcyclic(plan.steps);
+	// 空计划拦截也收敛在 dag.topoLayers 内（同一文案、同一触发）——此处不再重复检查；
+	// id 重复 / 依赖不存在 / 依赖环（含 dependsOn 重复项的保守报环）同样如此，
+	// 本模块只做编译器特有的变量名冲突校验。
+	const layers = topoLayers(plan.steps);
 	assertDistinctVarNames(plan.steps);
-	const layers = topoLayers(plan);
 	const lines: string[] = [];
 	const resultKeys: string[] = [];
 	for (const layer of layers) {

@@ -6,10 +6,13 @@
 // `{ agent, task, context: "fresh" }`），以受理 runId 等各自的 async-complete 事件，
 // entry 生命周期与整体状态全程落盘 run.json。
 //
-// 执行语义（M2 极简）：
-//   读取现有 run.json → status=running → 拓扑分层逐层执行（层内并行 spawn、层间串行）
+// 执行语义（M2 极简；M3-T3 增预算硬上限与层内并发钳制）：
+//   读取现有 run.json → status=running → 拓扑分层逐层执行（层内并行 spawn、层间串行；
+//   ctx.budget 存在时：计划步数超顶 → 拒绝执行整个计划[不 spawn 任何步]；
+//   层内并发按 maxParallelSubagents 分批钳制[批内并行、批间串行、某批失败不开下批]）
 //   → 全部成功 status=completed；任一步失败 / 手工中止（signal）→ status=failed、
 //   错误入对应 entry、整体失败即返回（不重试——重试与迭代是 M4 的领域）。
+//   预算拒绝对应的 run 级 error 一律以 "budget_exhausted:" 前缀落痕（诚实遥测 §7.3）。
 //
 // 协议事实（T1 锚定）：spawn 的 reply 只是受理（可能含 runId）；完成经
 // "subagent:async-complete" 事件通知，payload 结构未完全文档化——完成结果的解读
@@ -18,6 +21,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { topoLayers } from "./dag.ts";
 import type { SubagentsRpcClient } from "./rpc.ts";
 import type { RunRecord } from "../storage/workspace.ts";
 import type { IterationEntry, PlanDraft, PlanStep } from "../types.ts";
@@ -45,6 +49,20 @@ export interface ExecutePlanContext {
 	runId: string;
 	/** 数据根目录（生产 ~/.pi/loop/，测试临时目录） */
 	dataDir: string;
+	/**
+	 * 预算硬上限（SPEC §7.3，M3-T3；由 T4 从生效档位 EffortPreset 派生注入）。
+	 * 可选——缺省即 M2 行为零变化（不校验步数、层内全并行）。生效语义：
+	 *   - plan.steps.length > maxPlanSteps → 拒绝执行整个计划
+	 *     （status=failed + error="budget_exhausted: plan steps N > max M"，不 spawn 任何步；
+	 *     Designer/plan-schema 侧已先行校验——此处是执行层的双保险闸）
+	 *   - 层内并发 > maxParallelSubagents → 分批串行（批内并行；某批失败不开下批）
+	 */
+	budget?: {
+		/** 计划步骤数硬顶（超过即拒绝执行整个计划；恰好在上限 → 照常执行） */
+		maxPlanSteps: number;
+		/** 层内并发上限（同层超出分批钳制，不静默丢弃） */
+		maxParallelSubagents: number;
+	};
 	onUpdate?: (update: PlanUpdate) => void;
 	signal?: AbortSignal;
 }
@@ -61,6 +79,18 @@ export interface RunOutcome {
 	durationMs: number;
 	/** 最终迭代记录快照（与 run.json 落盘内容一致） */
 	iterations: IterationEntry[];
+	/**
+	 * 层内并发钳制的分批执行数（budget 传入时才出现的字段：「全部已开出的批次」
+	 * 的累计——层内不需分批时等于层数，拒绝执行时为 0；budget 缺省时字段缺省，
+	 * 保持 M2 返回形状零回归）。
+	 */
+	batches?: number;
+	/**
+	 * 运行级终止原因（run.json run 级 error 落痕的同源镜像：预算拒绝 →
+	 * "budget_exhausted: …" 前缀，中止 → "aborted"；step 级失败不设——错误细节
+	 * 在各 entry。T4 据此区分 LoopToolResult 的 budget_exhausted 收尾）。
+	 */
+	error?: string;
 }
 
 /** 单步完成等待超时上限：真实研究 agent 可跑数分钟，取保守宽裕值（M2 固定；M4 再与 effort 档位挂钩） */
@@ -71,6 +101,28 @@ const STOP_TIMEOUT_MS = 10_000;
 
 /** abort 竞速哨兵：完成 payload 是对象或 null，Symbol 保证不与之混淆 */
 const ABORTED = Symbol("pi-loop:aborted");
+
+/**
+ * spawn 失败的「超时/无应答」特征判定（M-1，M2 终审收口）：pi-subagents 缺席的
+ * 真实形态是请求无人应答直至客户端超时——SubagentsRpcClient 对此以 code:"timeout"
+ * 抛 RpcError。按结构化判据检测（不引用具体类——本模块按结构类型消费注入的 rpc，
+ * fake 抛的裸 Error 同样适用）：①错误对象携带 code==="timeout"；②错误消息含
+ * 无应答特征（"无 reply"/"超时"）。agent 不存在等真实拒绝两判据皆不沾——返回
+ * false，调用方不附安装引导、原样呈现失败原因（不把「已安装但被拒绝」误归因为
+ * 「未安装」）。
+ *
+ * M3-T5 起导出供 designer.ts 的 spawn 失败分支复用（M3-T4 review M-2 收口：
+ * designer 降级 notes 的安装引导与 orchestrator 的 M-1 采用同款门控，单一真源）。
+ */
+export function isNoReplyTimeout(error: unknown): boolean {
+	const code =
+		error !== null && typeof error === "object"
+			? (error as { code?: unknown }).code
+			: undefined;
+	if (code === "timeout") return true;
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes("无 reply") || message.includes("超时");
+}
 
 /** signal → 一次性 settle 的"已中止"哨兵 promise（竞速的从方） */
 interface AbortWatch {
@@ -129,45 +181,23 @@ function loadRunRecord(
 }
 
 /**
- * 拓扑分层（编译器同算法的独立实现——它的版本不导出，且 orchestrator 走逐步
- * spawn 路线不消费其产物）：层内步骤互不依赖（并行 spawn），层间串行。
- * 校验：空计划 / 重复 id / 未知依赖 / 不可分层（依赖环）都抛错。
- * 注：dependsOn 重复项（如 ["a","a"]）在本 filter 实现下不构成伪环
- * （编译器侧按计数 Kahn 会保守报环——该差异由 planner 负例锁定）。
+ * 层内并发钳制（budget 生效时）：把一层切成 ≤ maxParallelSubagents 的批序列——
+ * 批内并行（Promise.all）、批间串行（上批全部结算后才发下批；某批失败不开
+ * 下批，沿用 M2 层间 fail-fast 语义，不静默丢弃步骤）。budget 缺省
+ * （maxParallel 为 undefined）时返回 [layer] 单一整批——与 M2 的层内全并行
+ * 逐字等价（既有用例零回归的连接点）。前置：maxParallel ≥ 1（budget 形状校验）
+ * 且 layer 非空（topoLayers 不产生空层）。
  */
-function topoLayers(steps: PlanStep[]): PlanStep[][] {
-	if (steps.length === 0) {
-		throw new Error("计划校验失败：计划不含任何步骤");
+function chunkLayer(
+	layer: PlanStep[],
+	maxParallel: number | undefined,
+): PlanStep[][] {
+	if (maxParallel === undefined) return [layer];
+	const batches: PlanStep[][] = [];
+	for (let start = 0; start < layer.length; start += maxParallel) {
+		batches.push(layer.slice(start, start + maxParallel));
 	}
-	const byId = new Map<string, PlanStep>();
-	for (const step of steps) {
-		if (byId.has(step.id)) {
-			throw new Error(`计划校验失败：步骤 id 重复 "${step.id}"`);
-		}
-		byId.set(step.id, step);
-	}
-	for (const step of steps) {
-		for (const dep of step.dependsOn) {
-			if (!byId.has(dep)) {
-				throw new Error(
-					`计划校验失败：步骤 "${step.id}" 依赖不存在的步骤 "${dep}"`,
-				);
-			}
-		}
-	}
-	const layers: PlanStep[][] = [];
-	const remaining = new Map(byId);
-	while (remaining.size > 0) {
-		const layer = [...remaining.values()].filter((step) =>
-			step.dependsOn.every((dep) => !remaining.has(dep)),
-		);
-		if (layer.length === 0) {
-			throw new Error("计划分层失败：剩余步骤存在依赖环");
-		}
-		for (const step of layer) remaining.delete(step.id);
-		layers.push(layer);
-	}
-	return layers;
+	return batches;
 }
 
 /** 完成事件的防御性解读结果 */
@@ -293,6 +323,42 @@ export async function executePlan(
 ): Promise<RunOutcome> {
 	const startMs = Date.now();
 	const record = loadRunRecord(ctx.dataDir, ctx.runId);
+
+	// budget 注入面契约（受理前校验，与 run 记录缺席同类）：形状非法即原样上抛，
+	// run 记录保持磁盘原状（status 尚未迁移 running，无收尾义务）。
+	// 不静默钳位修正（如 maxParallelSubagents=0 当 1）——隐藏调用方 bug 不如报错
+	if (ctx.budget !== undefined) {
+		const shapeOk = (v: number): boolean => Number.isInteger(v) && v >= 1;
+		if (
+			!shapeOk(ctx.budget.maxPlanSteps) ||
+			!shapeOk(ctx.budget.maxParallelSubagents)
+		) {
+			throw new TypeError(
+				"budget 形状非法：maxPlanSteps 与 maxParallelSubagents 都必须是 ≥1 的整数",
+			);
+		}
+	}
+
+	// 预算硬上限第一道闸（SPEC §7.3，执行层双保险—— Designer/plan-schema 侧已先行
+	// 校验，此处是最后闸门）：计划步数超顶 → 拒绝执行整个计划。
+	// 不置 running、不 spawn 任何步：run 直接落 status=failed + 运行级 error
+	// （budget_exhausted: 前缀，诚实遥测）后即返；已完成 entry 语义不适用（一个未开）
+	if (ctx.budget !== undefined && plan.steps.length > ctx.budget.maxPlanSteps) {
+		const reason = `budget_exhausted: plan steps ${plan.steps.length} > max ${ctx.budget.maxPlanSteps}`;
+		record.status = "failed";
+		record.error = reason;
+		saveRecord();
+		return {
+			steps: plan.steps.length,
+			succeeded: 0,
+			failed: 0,
+			durationMs: Date.now() - startMs,
+			iterations: [...record.iterations],
+			batches: 0, // 拒绝执行：一批准也未开出（budget 已生效——字段在场）
+			error: reason,
+		};
+	}
+
 	// 状态机（计划锚定）：created → running → completed | failed
 	record.status = "running";
 	saveRecord();
@@ -352,10 +418,14 @@ export async function executePlan(
 			runId = acceptance.runId;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			// M-1（M2 终审收口）：安装引导仅在超时/无应答特征时附加——pi-subagents 缺席
+			// 的真实形态；agent 不存在等真实拒绝原样报错，不误归因为「请安装」
 			return failEntry(
 				entry,
 				step,
-				`${message}（pi-subagents 不在或不可用——请安装 pi-subagents 扩展后重试）`,
+				isNoReplyTimeout(error)
+					? `${message}（pi-subagents 不在或不可用——请安装 pi-subagents 扩展后重试）`
+					: message,
 			);
 		}
 
@@ -424,6 +494,10 @@ export async function executePlan(
 	}
 
 	let planFailed = false;
+	/** 层内并发上限（budget 缺省 = 不钳制：整层一批，与 M2 层内全并行逐字等价） */
+	const maxParallel = ctx.budget?.maxParallelSubagents;
+	/** 已开出的执行批次数（budget 生效时随 outcome 遥测上报） */
+	let batchesIssued = 0;
 	try {
 		const layers = topoLayers(plan.steps);
 		for (const layer of layers) {
@@ -432,13 +506,24 @@ export async function executePlan(
 				planFailed = true;
 				break;
 			}
-			// 层内并行：每步独立 spawn（受理顺序无关紧要），全部 settle 后才进下一层；
-			// 层内失败者已各自落 failed entry，其余在途步会自然结算完成（不产生悬挂 subagent）
-			const outcomes = await Promise.all(layer.map((step) => runStep(step)));
-			if (outcomes.includes(false)) {
-				planFailed = true; // 失败即返：不执行后续层（不重试——M4 领域）
-				break;
+			// 层内并行（budget 钳制时按 maxParallelSubagents 分批：批内并行、批间串行）：
+			// 每步独立 spawn（受理顺序无关紧要），整批 settle 后才发下批；
+			// 层内失败者已各自落 failed entry，其余在途步自然结算完成（不产生悬挂 subagent）
+			for (const batch of chunkLayer(layer, maxParallel)) {
+				// abort 检查点：批与批之间（与层间同语义——中止后不再开新批；
+				// 兜住「整批已恰好完成但下一批尚未发出」的竞速窗口）
+				if (ctx.signal?.aborted) {
+					planFailed = true;
+					break;
+				}
+				if (ctx.budget !== undefined) batchesIssued++;
+				const outcomes = await Promise.all(batch.map((step) => runStep(step)));
+				if (outcomes.includes(false)) {
+					planFailed = true; // 批内失败：不开下批/后续层（不重试——M4 领域）
+					break;
+				}
 			}
+			if (planFailed) break;
 		}
 	} catch (error) {
 		// 计划校验 / 基建类异常（JSON.parse、磁盘等）：run 标记 failed 后原样上抛
@@ -454,11 +539,17 @@ export async function executePlan(
 
 	// 遥测（快照：防迟到的在途结算改动已返回的对象）
 	const iterations = [...record.iterations];
-	return {
+	const outcome: RunOutcome = {
 		steps: plan.steps.length,
 		succeeded: iterations.filter((entry) => entry.status === "succeeded").length,
 		failed: iterations.filter((entry) => entry.status === "failed").length,
 		durationMs: Date.now() - startMs,
 		iterations,
 	};
+	// budget 生效的运行才上报分批遥测（budget 缺省路径的字段形保持 M2 逐字零回归）
+	if (ctx.budget !== undefined) outcome.batches = batchesIssued;
+	// 运行级 error 落痕的镜像（中止时 finally 已记 "aborted"；预算拒绝在早退路径
+	// 已直接返回）——step 级失败不在此列（细节在各 entry）
+	if (record.error !== undefined) outcome.error = record.error;
+	return outcome;
 }

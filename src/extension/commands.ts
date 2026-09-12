@@ -141,17 +141,31 @@ function countFiles(dir: string): number {
 }
 
 /**
- * /loop 的进度节流器（task brief：命令侧 notify 每步一条）。
- * onUpdate 对同一步会先 running 后终态，直接逐条转发会每步多发——按 stepId
- * 计数去重，只投递首条；迟到的重复更新静默吞掉，终态汇总由 handler 的完成摘要兜底。
+ * /loop 的进度节流器（T4-M2 复评兑现：终态可见性升级）。
+ * 旧语义「按 stepId 仅首条胜出」会吞掉每步的终态——失败步在收尾摘要之外无感知。
+ * 新语义（目标口径：3 步计划含 1 失败 → notify 数 = 开始条数(1) + 终态条数(3)）：
+ * - 开始信号：首个非终态更新（running）投递一条，代表计划开跑；其后各步的
+ *   running 并入该条（合并投递，不再逐步重复）；
+ * - 终态：每步成功/失败各投一条（成功/失败都发；按 stepId+终态去重，迟到的
+ *   重复投递静默吞掉），失败走 error 级——终态不丢是本次升级的核心。
  */
 export function makeStepNotifier(
   notify: (message: string, level?: "info" | "warning" | "error") => void,
 ): (update: PlanUpdate) => void {
-  const seen = new Set<string>();
+  let startNotified = false;
+  const terminalSeen = new Set<string>();
   return (update) => {
-    if (seen.has(update.stepId)) return;
-    seen.add(update.stepId);
+    if (update.status === "succeeded" || update.status === "failed") {
+      const key = `${update.stepId}\u0000${update.status}`;
+      // 终态去重：同 stepId 同终态的迟到重复投递静默吞掉
+      if (terminalSeen.has(key)) return;
+      terminalSeen.add(key);
+    } else if (startNotified) {
+      // 非终态（running/pending）：开始信号只发首条，后续并入
+      return;
+    } else {
+      startNotified = true;
+    }
     notify(
       describeStepUpdate(update),
       update.status === "failed" ? "error" : "info",
@@ -180,7 +194,7 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
           ? {}
           : { contextPaths: parsed.contextPaths }),
       };
-      // 进度：每步一条 notify（stepId 去重节流）；完成后另发一条摘要（其余命令均只在完成时 notify 一条）
+      // 进度：开始 1 条 + 每步终态 1 条（makeStepNotifier 节流）；完成后另发一条摘要
       const notifyStep = makeStepNotifier(ctx.ui.notify);
       try {
         const result = await runLoopTask(params, {

@@ -38,7 +38,7 @@ type SchemaParams = {
   contextPaths?: string[];
 };
 
-/** LoopToolResult 的 JSON 序列化（含遥测真值与失败原因，转文本 content 给模型） */
+/** LoopToolResult 的 JSON 序列化（含遥测真值/计划摘要/失败原因，转文本 content 给模型） */
 function resultToText(result: LoopToolResult): string {
   const payload: Record<string, unknown> = {
     status: result.status,
@@ -48,6 +48,7 @@ function resultToText(result: LoopToolResult): string {
     telemetry: result.telemetry,
     summary: result.summary,
   };
+  if (result.plan !== undefined) payload.plan = result.plan; // M3-T4：工具可见的计划摘要（origin/steps/degraded）
   if (result.error !== undefined) payload.error = result.error;
   return JSON.stringify(payload, null, 2);
 }

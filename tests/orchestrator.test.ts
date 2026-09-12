@@ -392,6 +392,50 @@ describe("executePlan — 失败路径", () => {
 			"c:failed",
 		]);
 		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
+		// M3-T4 顺手（T3 review M2 收口）：outcome.error 镜像未随 budget 门控——
+		// no-budget abort 的返回形是 additive 变化（error 在场、batches 缺席），入档锁定
+		expect(outcome.error).toBe("aborted");
+		expect("batches" in outcome).toBe(false);
+	});
+});
+
+describe("executePlan — spawn 失败归因（M-1：仅超时/无应答附安装引导）", () => {
+	it("code=timeout 的受理失败 → 错误附安装引导（结构化判据，非仅文案匹配）", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		// 消息不含“超时/无 reply”字样——引导后缀只能来自 code==="timeout" 判据
+		const timeoutLike = new Error("RPC spawn 失败: 客户端放弃等待应答");
+		(timeoutLike as Error & { code?: string }).code = "timeout";
+		fake.spawnError = timeoutLike;
+		const outcome = await executePlan(fanPlan(), { rpc: fake, runId, dataDir });
+
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		expect(final.iterations).toHaveLength(2); // b、c 均在受理层被拒；a 未尝试
+		for (const entry of final.iterations) {
+			expect(entry.error).toContain("放弃等待应答");
+			expect(entry.error).toContain("请安装 pi-subagents");
+			expect(entry.startedAt).toBeUndefined(); // 未受理即失败：无 running 态痕迹
+		}
+		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
+	});
+
+	it("真实拒绝（agent 不存在）→ 原样报错，不附安装引导（不误归因为未安装）", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		const rejected = new Error('RPC spawn 失败: Agent "worker-b" 不存在');
+		(rejected as Error & { code?: string }).code = "agent_not_found";
+		fake.spawnError = rejected;
+		const outcome = await executePlan(fanPlan(), { rpc: fake, runId, dataDir });
+
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		for (const entry of final.iterations) {
+			expect(entry.error).toContain('Agent "worker-b" 不存在');
+			expect(entry.error).not.toContain("请安装 pi-subagents");
+			expect(entry.error).not.toContain("pi-subagents 不在或不可用");
+		}
+		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
 	});
 });
 
@@ -631,5 +675,222 @@ describe("executePlan — 前置错误", () => {
 		).rejects.toThrow(/不含任何步骤/);
 		expect(readRecord(dataDir, runId).status).toBe("failed");
 		expect(fake.spawns).toHaveLength(0);
+	});
+});
+
+describe("executePlan — 预算硬上限与层内并发钳制（M3-T3）", () => {
+	/** n 步同层（互不依赖）计划——层内并发钳制用例的最小形状 */
+	function widePlan(n = 4): PlanDraft {
+		return {
+			steps: Array.from({ length: n }, (_, i) => ({
+				id: `w${i + 1}`,
+				agent: `worker-w${i + 1}`,
+				task: `任务 w${i + 1}`,
+				dependsOn: [],
+			})),
+		};
+	}
+
+	it("4 步同层 / maxParallelSubagents=2 → 两批：前 2 步完成前第 3 步未被 spawn（批序时序证明）", async () => {
+		const { dataDir, runId } = setupRun();
+		// 前两步延迟投递（40ms）、后两步最快（1ms）——若实现未分批（M2 无上限行为），
+		// w3/w4 会在 w1/w2 完成前 spawn 并先完成，下述快照断言即告失败（时序可证伪）
+		const fake = new FakeRpc()
+			.script("worker-w1", { delayMs: 40, output: "OUT_W1" })
+			.script("worker-w2", { delayMs: 40, output: "OUT_W2" })
+			.script("worker-w3", { delayMs: 1, output: "OUT_W3" })
+			.script("worker-w4", { delayMs: 1, output: "OUT_W4" });
+		/** fake 的时序钩子：首个 running 上报瞬间的 spawn 台账与 w3 受理瞬间的完成事件台账 */
+		let spawnsAtFirstRunning: number | undefined;
+		let deliveredAtW3Start: string[] | undefined;
+		const updates: PlanUpdate[] = [];
+		const outcome = await executePlan(widePlan(), {
+			rpc: fake,
+			runId,
+			dataDir,
+			budget: { maxPlanSteps: 8, maxParallelSubagents: 2 },
+			onUpdate: (update) => {
+				updates.push(update);
+				if (update.status === "running" && spawnsAtFirstRunning === undefined) {
+					spawnsAtFirstRunning = fake.spawns.length;
+				}
+				if (update.stepId === "w3" && update.status === "running") {
+					deliveredAtW3Start = [...fake.delivered];
+				}
+			},
+		});
+		expect(outcome.batches).toBe(2); // 4 步 / 上限 2 → 两个批次
+		// 批 1 窗口：首个 running 上报时只有 w1、w2 被 spawn（未钳制时会是 4）
+		expect(spawnsAtFirstRunning).toBe(2);
+		// 强门时序证明：w3 受理瞬间，批 1 的两个完成事件都已投递（且仅此两个）
+		expect(deliveredAtW3Start).toEqual([
+			fake.spawns[0].runId,
+			fake.spawns[1].runId,
+		]);
+		// 终态：批序整体 = w1,w2 → w3,w4；完成序同序（批 1 的 40ms 事件先于批 2 的 1ms）
+		expect(fake.spawns.map((s) => s.agent)).toEqual([
+			"worker-w1",
+			"worker-w2",
+			"worker-w3",
+			"worker-w4",
+		]);
+		expect(fake.delivered).toEqual(fake.spawns.map((s) => s.runId));
+		expect(updates.map((u) => `${u.stepId}:${u.status}`)).toEqual([
+			"w1:running",
+			"w2:running",
+			"w1:succeeded",
+			"w2:succeeded",
+			"w3:running",
+			"w4:running",
+			"w3:succeeded",
+			"w4:succeeded",
+		]);
+		expect(readRecord(dataDir, runId).status).toBe("completed");
+		expect(outcome).toMatchObject({ steps: 4, succeeded: 4, failed: 0 });
+	});
+
+	it("计划步数恰好在上限（n == maxPlanSteps）→ 照常执行；层不需分批时批数=层数", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc()
+			.script("worker-b", { output: "OUT_B" })
+			.script("worker-c", { output: "OUT_C" })
+			.script("worker-a", { output: "OUT_A" });
+		const outcome = await executePlan(fanPlan(), {
+			rpc: fake,
+			runId,
+			dataDir,
+			budget: { maxPlanSteps: 3, maxParallelSubagents: 2 },
+		});
+		expect(fake.spawns.map((s) => s.agent)).toEqual([
+			"worker-b",
+			"worker-c",
+			"worker-a",
+		]);
+		expect(readRecord(dataDir, runId).status).toBe("completed");
+		// 层 [b,c]（≤2 一批）与层 [a]（1 步一批）→ 共 2 批
+		expect(outcome.batches).toBe(2);
+		expect(outcome.steps).toBe(3);
+		expect(outcome.error).toBeUndefined(); // 正常完成不带运行级 error
+	});
+
+	it("计划步数超顶 → 拒绝执行整个计划：failed + budget_exhausted 落痕，零 spawn", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		const outcome = await executePlan(fanPlan(), {
+			rpc: fake,
+			runId,
+			dataDir,
+			budget: { maxPlanSteps: 2, maxParallelSubagents: 2 },
+		});
+		expect(fake.spawns).toEqual([]); // 未 spawn 任何步
+		expect(fake.waits).toEqual([]); // 亦未等待任何完成
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		expect(final.error).toBe("budget_exhausted: plan steps 3 > max 2");
+		expect(final.iterations).toEqual([]); // 没有任何步进入计划
+		expect(outcome).toMatchObject({
+			steps: 3,
+			succeeded: 0,
+			failed: 0,
+			batches: 0,
+			error: "budget_exhausted: plan steps 3 > max 2",
+		});
+		expect(outcome.iterations).toEqual([]);
+	});
+
+	it("分批中途失败（批 1 的 w1 失败）→ 不开下批：w3/w4 未 spawn 无 entry，fail-fast 语义保持", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc()
+			.script("worker-w1", { errorMessage: "w1 的结论站不住" })
+			.script("worker-w2", { output: "OUT_W2" });
+		const outcome = await executePlan(widePlan(), {
+			rpc: fake,
+			runId,
+			dataDir,
+			budget: { maxPlanSteps: 8, maxParallelSubagents: 2 },
+		});
+		// 只 spawn 了批 1（w1、w2）；批 2（w3、w4）因批内失败不再开
+		expect(fake.spawns.map((s) => s.agent)).toEqual(["worker-w1", "worker-w2"]);
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		expect(final.iterations.map((e) => e.stepId)).toEqual(["w1", "w2"]); // w3/w4 未进计划
+		const byStep = new Map(final.iterations.map((e) => [e.stepId, e]));
+		expect(byStep.get("w1")).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("w1 的结论站不住"),
+		});
+		expect(byStep.get("w2")).toMatchObject({
+			status: "succeeded",
+			outputRef: "OUT_W2",
+		});
+		expect(outcome).toMatchObject({
+			steps: 4,
+			succeeded: 1,
+			failed: 1,
+			batches: 1,
+		});
+	});
+
+	it("批间中止 → 同批在途步记 aborted、下批不再开（abort 检查点扩展到批间）", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc()
+			.script("worker-w1", { hold: true })
+			.script("worker-w2", { hold: true });
+		const controller = new AbortController();
+		const pending = executePlan(widePlan(), {
+			rpc: fake,
+			runId,
+			dataDir,
+			budget: { maxPlanSteps: 8, maxParallelSubagents: 2 },
+			signal: controller.signal,
+		});
+		await sleep(5);
+		controller.abort();
+		const outcome = await pending;
+		// 批 1 在途步被 stop + 记 aborted；批 2（w3/w4）未开——无 entry、无 spawn
+		expect(fake.spawns.map((s) => s.agent)).toEqual(["worker-w1", "worker-w2"]);
+		expect(fake.stopCalls).toEqual(fake.spawns.map((s) => s.runId));
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		expect(final.error).toBe("aborted");
+		expect(final.iterations.map((e) => e.stepId)).toEqual(["w1", "w2"]); // w3/w4 未进计划
+		expect(final.iterations.every((e) => e.error === "aborted")).toBe(true);
+		expect(outcome).toMatchObject({
+			steps: 4,
+			succeeded: 0,
+			failed: 2,
+			batches: 1,
+			error: "aborted",
+		});
+	});
+
+	it("budget 形状非法（maxParallelSubagents=0）→ 受理前原样上抛，run 记录保持原状", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		// 注入面契约违规（分批宽度 0 会使分批循环退化）→ 前置拒绝，不静默钳位修正
+		await expect(
+			executePlan(widePlan(1), {
+				rpc: fake,
+				runId,
+				dataDir,
+				budget: { maxPlanSteps: 8, maxParallelSubagents: 0 },
+			}),
+		).rejects.toThrow(/maxParallelSubagents/);
+		expect(fake.spawns).toEqual([]);
+		// run.json 保持磁盘原状（status 仍 created——未受理即无收尾义务）
+		expect(readRecord(dataDir, runId).status).toBe("created");
+	});
+
+	it("budget 未传 → 遥测不带 batches/error 字段（M2 返回形状逐字保持）", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc()
+			.script("worker-b", { output: "OUT_B" })
+			.script("worker-c", { output: "OUT_C" })
+			.script("worker-a", { output: "OUT_A" });
+		const outcome = await executePlan(fanPlan(), { rpc: fake, runId, dataDir });
+		expect(readRecord(dataDir, runId).status).toBe("completed");
+		expect(outcome.succeeded).toBe(3);
+		expect("batches" in outcome).toBe(false);
+		expect("error" in outcome).toBe(false);
 	});
 });

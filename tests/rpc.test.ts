@@ -166,6 +166,75 @@ describe("SubagentsRpcClient.waitForCompletion", () => {
 	});
 });
 
+describe("SubagentsRpcClient.spawn 的受理归一化（M3-T5 Fix round 2，e2e 实跑校准）", () => {
+	it("宿主真实形态：runId 藏 details.runId → 提取到顶层，text/details 原样透传", async () => {
+		const bus = new FakeBus();
+		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 1000 });
+		const pending = client.spawn({ agent: "researcher", task: "按步执行" });
+		// 宿主受理形态（pi-subagents async-execution.ts:2091）：顶层无 runId，
+		// 藏在 details（text 首行受理头另有副本）——不归一化则多步计划被拒
+		bus.replyLast({
+			success: true,
+			data: {
+				text: "Async: researcher [r-host-1]\n\n受理 guidance 多行……",
+				details: {
+					mode: "single",
+					runId: "r-host-1",
+					asyncId: "r-host-1",
+					results: [],
+				},
+			},
+		});
+		const acceptance = await pending;
+		// runId 归一化到顶层（消费方 orchestrator/designer 只读这一层）
+		expect(acceptance.runId).toBe("r-host-1");
+		// 其余字段原样透传（浅拷贝，不 mutate 原对象）
+		expect(acceptance.text).toContain("Async: researcher [r-host-1]");
+		expect(acceptance.details).toMatchObject({
+			mode: "single",
+			runId: "r-host-1",
+		});
+	});
+
+	it("details 无 runId（asyncId 形态）→ asyncId 通道提取", async () => {
+		const bus = new FakeBus();
+		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 1000 });
+		const pending = client.spawn({ agent: "researcher", task: "asyncId 变体" });
+		bus.replyLast({
+			success: true,
+			data: {
+				text: "Async: researcher [r-host-2]……",
+				details: { mode: "single", asyncId: "r-host-2", results: [] },
+			},
+		});
+		await expect(pending).resolves.toMatchObject({ runId: "r-host-2" });
+	});
+
+	it("details 无 runId/asyncId 但 text 有受理头 → 正则兜底提取", async () => {
+		const bus = new FakeBus();
+		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 1000 });
+		const pending = client.spawn({ agent: "researcher", task: "text 兜底" });
+		// details 变形（无 runId/asyncId）：受理头正则从 text 首行提取
+		bus.replyLast({
+			success: true,
+			data: {
+				text: "Async: researcher [r-fb-9]\n\n(受理 guidance)",
+				details: { mode: "single", results: [] },
+			},
+		});
+		await expect(pending).resolves.toMatchObject({ runId: "r-fb-9" });
+	});
+
+	it("顶层 runId（M2 造形）保持原样——向后兼容", async () => {
+		const bus = new FakeBus();
+		const client = new SubagentsRpcClient(bus, { defaultTimeoutMs: 1000 });
+		const pending = client.spawn({ agent: "researcher", task: "旧形状" });
+		// M2 时代 fake/既有用例造的形状：顶层直给 runId——归一化不得破坏
+		bus.replyLast({ success: true, data: { runId: "r-legacy-3" } });
+		await expect(pending).resolves.toMatchObject({ runId: "r-legacy-3" });
+	});
+});
+
 describe("listener 卫生", () => {
 	it("reply 后 handler 已卸载：再 emit 不再触发", async () => {
 		const bus = new FakeBus();

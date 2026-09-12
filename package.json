@@ -12,8 +12,10 @@
     "typecheck": "tsc --noEmit",
     "smoke": "bash scripts/smoke.sh"
   },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0"
+  },
   "devDependencies": {
-    "@sinclair/typebox": "^0.34.0",
     "@types/node": "^20.19.43",
     "typescript": "^5.7.0",
     "vitest": "^3.2.0"
