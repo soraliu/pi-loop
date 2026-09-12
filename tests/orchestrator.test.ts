@@ -88,6 +88,8 @@ interface FakeOutcome {
 	output?: string;
 	/** 事件 summary 字段（→ onUpdate.summary） */
 	summary?: string;
+	/** 原样并入完成 payload 的附加字段（构造非常规字段名的完成事件用，Fix round 2） */
+	extras?: Record<string, unknown>;
 }
 
 /** 脚本化 fake RPC：pi-subagents 调度器 + T1 客户端事件流语义的最小合流体 */
@@ -179,6 +181,7 @@ class FakeRpc {
 		if (outcome.errorMessage === undefined) {
 			if (outcome.output !== undefined) payload.output = outcome.output;
 			if (outcome.summary !== undefined) payload.summary = outcome.summary;
+			Object.assign(payload, outcome.extras);
 		} else {
 			payload.ok = false;
 			payload.error = { code: "agent_failed", message: outcome.errorMessage };
@@ -487,6 +490,92 @@ describe("executePlan — BUILTIN_PLAN 单步最小路径（T4 直连口径）",
 			failed: 0,
 			durationMs: expect.any(Number),
 		});
+	});
+
+	it("完成 payload 经 results[0] 携带产物引用（真实形 outputReference/artifactPaths）→ outputRef 有效", async () => {
+		// Fix round 2 实测校准：真实完成事件（pi-subagents CompletionNotification）不含顶层
+		// output/outputPath——产物路径在 results[0].outputReference（string | {path}）与
+		// results[0].artifactPaths.outputPath；顶层三字段保留 fake 兼容（已由上一用例锁定）
+		const first = setupRun("产物引用之 outputReference");
+		const fake = new FakeRpc().script("researcher", {
+			summary: "结论一",
+			extras: {
+				results: [
+					{
+						agent: "researcher",
+						status: "succeeded",
+						outputReference: {
+							path: "/runs/x/subagent-artifacts/outputs/research.md",
+						},
+					},
+				],
+			},
+		});
+		const outcome1 = await executePlan(
+			BUILTIN_PLAN("产物引用之 outputReference"),
+			{
+				rpc: fake,
+				runId: first.runId,
+				dataDir: first.dataDir,
+			},
+		);
+		expect(outcome1.succeeded).toBe(1);
+		expect(outcome1.iterations[0]?.outputRef).toBe(
+			"/runs/x/subagent-artifacts/outputs/research.md",
+		);
+
+		const second = setupRun("产物引用之 artifactPaths");
+		const fake2 = new FakeRpc().script("researcher", {
+			summary: "结论二",
+			extras: {
+				results: [
+					{
+						agent: "researcher",
+						status: "succeeded",
+						outputReference: "/runs/y/string-form.md",
+						artifactPaths: {
+							outputPath: "/runs/y/subagent-artifacts/outputs/research.md",
+						},
+					},
+				],
+			},
+		});
+		// string 形 outputReference 优先于 artifactPaths.outputPath（集合顺序）
+		const outcome2 = await executePlan(BUILTIN_PLAN("产物引用之 artifactPaths"), {
+			rpc: fake2,
+			runId: second.runId,
+			dataDir: second.dataDir,
+		});
+		expect(outcome2.succeeded).toBe(1);
+		expect(outcome2.iterations[0]?.outputRef).toBe("/runs/y/string-form.md");
+
+		const third = setupRun("产物引用之仅 artifactPaths");
+		const fake3 = new FakeRpc().script("researcher", {
+			summary: "结论三",
+			extras: {
+				results: [
+					{
+						agent: "researcher",
+						status: "succeeded",
+						artifactPaths: {
+							outputPath: "/runs/z/subagent-artifacts/outputs/research.md",
+						},
+					},
+				],
+			},
+		});
+		const outcome3 = await executePlan(
+			BUILTIN_PLAN("产物引用之仅 artifactPaths"),
+			{
+				rpc: fake3,
+				runId: third.runId,
+				dataDir: third.dataDir,
+			},
+		);
+		expect(outcome3.succeeded).toBe(1);
+		expect(outcome3.iterations[0]?.outputRef).toBe(
+			"/runs/z/subagent-artifacts/outputs/research.md",
+		);
 	});
 
 	it("受理缺省 runId 的单步计划：按任意完成事件等待（降级路径可用）", async () => {

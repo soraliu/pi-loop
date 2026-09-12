@@ -210,6 +210,8 @@ describe("loop_task 工具", () => {
     );
     expect(res.content[0].type).toBe("text");
     expect(res.content[0].text).toContain("task");
+    // M2-T5 收口：校验类 TypeError → 参数错误前缀（与执行链异常区分）
+    expect(res.content[0].text).toContain("参数错误");
   });
 
   it("非法 effort → 错误 content 含四个合法值", async () => {
@@ -232,6 +234,34 @@ describe("loop_task 工具", () => {
       expect(res.content[0].text).toContain("medium");
       expect(res.content[0].text).toContain("high");
       expect(res.content[0].text).toContain("max");
+      // M2-T5 收口：非法 effort 同为校验类 TypeError → 参数错误前缀
+      expect(res.content[0].text).toContain("参数错误");
+      expect((res.details as { error?: string }).error).toBeDefined();
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("执行链异常（非 TypeError）→ 前缀'执行出错'（与参数错误区分）", async () => {
+    // dataDir 指向普通文件：ensureWorkspace 的 mkdir 抛 ENOTDIR（Error 而非
+    // TypeError）——走 catch 的执行链分支而非参数分支，锁定前缀区分的另一半
+    const tmp = makeTempDir();
+    const notDir = path.join(tmp, "occupied");
+    fs.writeFileSync(notDir, "x");
+    const saved = setLoopEnv(notDir, "real");
+    try {
+      const { pi, tools } = makeFakePi();
+      registerLoopTools(pi);
+      const def = tools.get("loop_task")!;
+      const res = await def.execute(
+        "t-exec-err",
+        { task: "参数合法但执行链异常的任务" },
+        new AbortController().signal,
+        () => {},
+        {},
+      );
+      expect(res.content[0].text).toContain("loop_task 执行出错");
+      expect(res.content[0].text).not.toContain("参数错误");
       expect((res.details as { error?: string }).error).toBeDefined();
     } finally {
       restoreEnv(saved);

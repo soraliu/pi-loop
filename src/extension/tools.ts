@@ -101,8 +101,11 @@ function makeExecuteLoopTask(pi: PiExtensionApi) {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // 错误前缀区分（T4 review 收口）：校验类 TypeError（task 缺失/effort 非法）→ "参数错误"；
+      // 其余执行链异常 → "执行出错"——两类失败在 content 上可归因
+      const prefix = error instanceof TypeError ? "参数错误" : "执行出错";
       return {
-        content: [{ type: "text", text: `loop_task 执行出错: ${message}` }],
+        content: [{ type: "text", text: `loop_task ${prefix}: ${message}` }],
         details: { error: message },
       };
     }

@@ -178,7 +178,7 @@ interface CompletionReading {
 	error?: string;
 	/** 摘要（onUpdate 透传用；payload 无可读摘要时缺省） */
 	summary?: string;
-	/** 输出引用（payload 带 output/outputPath/result.output 时） */
+	/** 输出引用（完成 payload 的 output/outputPath/result.output/results[0] 产物引用，宽集合） */
 	outputRef?: string;
 }
 
@@ -186,6 +186,16 @@ interface CompletionReading {
 function firstString(...values: unknown[]): string | undefined {
 	for (const value of values) {
 		if (typeof value === "string" && value.length > 0) return value;
+	}
+	return undefined;
+}
+
+/** outputReference 形态兼容（Fix round 2）：string 直取，{path} 对象取 path，其余落空 */
+function stringOrPath(value: unknown): string | undefined {
+	if (typeof value === "string" && value.length > 0) return value;
+	if (value !== null && typeof value === "object") {
+		const inner = (value as { path?: unknown }).path;
+		if (typeof inner === "string" && inner.length > 0) return inner;
 	}
 	return undefined;
 }
@@ -244,7 +254,25 @@ function readCompletion(payload: unknown): CompletionReading {
 		typeof p.result === "string" ? p.result : undefined,
 	);
 	if (summary !== undefined) reading.summary = truncate(summary);
-	const outputRef = firstString(p.output, p.outputPath, result.output);
+	// outputRef 宽集合（Fix round 2 实测校准）：真实完成事件（pi-subagents
+	// CompletionNotification）不含顶层 output/outputPath——产物路径在
+	// results[0].outputReference（string | {path}）与 results[0].artifactPaths.outputPath
+	// （实验证的另一个候选源为 savedOutputPath，仅在 foreground 层存在，不属本事件形）；
+	// 顶层三字段保留（fake/旧形态兼容），firstString 类型守卫取 string 即用
+	const first = Array.isArray(p.results)
+		? ((p.results as Array<Record<string, unknown>>)[0] ?? {})
+		: {};
+	const artifacts =
+		typeof first.artifactPaths === "object" && first.artifactPaths !== null
+			? (first.artifactPaths as Record<string, unknown>)
+			: {};
+	const outputRef = firstString(
+		p.output,
+		p.outputPath,
+		result.output,
+		stringOrPath(first.outputReference),
+		artifacts.outputPath,
+	);
 	if (outputRef !== undefined) reading.outputRef = outputRef;
 	return reading;
 }

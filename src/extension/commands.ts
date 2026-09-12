@@ -143,7 +143,7 @@ function countFiles(dir: string): number {
 /**
  * /loop 的进度节流器（task brief：命令侧 notify 每步一条）。
  * onUpdate 对同一步会先 running 后终态，直接逐条转发会每步多发——按 stepId
- * 计数去重，只投递首条；迟到的重复更新静默吞掉，终态汇总由 handler 的完成摘要兑底。
+ * 计数去重，只投递首条；迟到的重复更新静默吞掉，终态汇总由 handler 的完成摘要兜底。
  */
 export function makeStepNotifier(
   notify: (message: string, level?: "info" | "warning" | "error") => void,

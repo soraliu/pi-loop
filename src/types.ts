@@ -33,7 +33,7 @@ export type EffortPresetsMap = Record<EffortLevel, EffortPreset>;
 export interface LoopToolParams {
 	/** 用户指派的任务描述（必填） */
 	task: string;
-	/** 激进度档位；缺省时由 runLoopTaskStub 回落 DEFAULT_EFFORT_LEVEL，非法值抛 TypeError */
+	/** 激进度档位；缺省时由 prepareRun 回落 DEFAULT_EFFORT_LEVEL，非法值抛 TypeError */
 	effort?: EffortLevel;
 	/** 可选的机器验收命令（存在时优先于 critic 打分，SPEC §7.4 诚实遥测） */
 	verifyCommand?: string;
