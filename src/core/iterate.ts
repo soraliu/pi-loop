@@ -26,7 +26,9 @@
 // 不重设计。
 //
 // 诚实遥测（SPEC §7.4）：verified 只能来自 evaluator（机器断言/critic 结论原文）；
-// 本引擎对一切非 verified 收尾如实留档（evaluation/final），不虚报通过。
+// 本引擎对一切非 verified 收尾如实留档（evaluation/final），不虚报通过。终态
+// telemetry 随收尾一并落盘（agents=/全轮 entry 去重计数 + 末轮口径计数——零执行
+// 事实时整个块 omit，不写假 0）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -177,7 +179,15 @@ function stampEntriesRound(
 	return record.iterations;
 }
 
-/** 收尾落盘：round/evaluation/final 三键 + 终态 status/error（读改写——磁盘为事实源） */
+/**
+ * 收尾落盘：round/evaluation/final 三键 + 终态 status/error + telemetry 遥测块
+ * （读改写——磁盘为事实源）。遥测口径（M4-T3，SPEC §5 对账）：steps=末轮计划
+ * 步数、succeeded/failed=末轮分轮切片计数（历史轮失败不混入，与
+ * buildIteratedResult 的 LoopToolResult.telemetry 同源）、iterations=累计调度
+ * 次数、agents=全部轮次 entry 的 agent 去重数、durationMs=闭环墙钟。诚实遥测：
+ * 零 entry 即无执行事实（空计划拒绝/预中止短路路径）——整个 telemetry 块
+ * omit，不写假 0；SPEC §5 的 turns 无从获得真实轮次数据，恒不落。
+ */
 function finalizeRunRecord(
 	ctx: IterateContext,
 	final: {
@@ -185,6 +195,10 @@ function finalizeRunRecord(
 		error?: string;
 		round: number;
 		evaluation: Evaluation;
+		/** 末轮执行事实（遥测素材：末轮 steps 与全轮 entries 快照） */
+		runOutcome: RunOutcome;
+		/** 闭环墙钟毫秒（runWithIterations 入口起计——含 designer/执行/评估等待） */
+		wallMs: number;
 	},
 ): void {
 	const record = readRunRecord(ctx.dataDir, ctx.runId);
@@ -197,6 +211,24 @@ function finalizeRunRecord(
 	};
 	record.status = final.status;
 	if (final.error !== undefined) record.error = final.error;
+	// agents：全部轮次 entry 的 agent 去重（同一 agent 多步多轮只计 1）——零 entry
+	// 即无 spawn 受理事实，telemetry 整体 omit（run.json 无该键，而非全零对象）
+	const agents = new Set(final.runOutcome.iterations.map((entry) => entry.agent))
+		.size;
+	if (agents >= 1) {
+		const lastRoundEntries = final.runOutcome.iterations.filter(
+			(entry) => entry.round === final.round,
+		);
+		record.telemetry = {
+			steps: final.runOutcome.steps,
+			succeeded: lastRoundEntries.filter((entry) => entry.status === "succeeded")
+				.length,
+			failed: lastRoundEntries.filter((entry) => entry.status === "failed").length,
+			iterations: final.runOutcome.iterations.length,
+			durationMs: final.wallMs,
+			agents,
+		};
+	}
 	writeRunRecord(ctx.dataDir, ctx.runId, record);
 }
 
@@ -310,6 +342,9 @@ export async function runWithIterations(
 	ctx: IterateContext,
 ): Promise<IterationResult> {
 	const maxReruns = Math.max(0, preset.maxResultIterations);
+	// 闭环计时起点（终态 telemetry.durationMs 的口径：本函数入口——含 designer
+	// 设计/执行/评估等待的全程，各收尾分支取 Date.now() 差值落盘）
+	const loopStartedAt = Date.now();
 
 	// ① 首轮设计（designer 自带降级链，不抛出）；plan 元信息交扩展层落盘
 	let designed = await generatePlan(task, preset, {
@@ -385,6 +420,8 @@ export async function runWithIterations(
 				error: runOutcome.error,
 				round,
 				evaluation: rejected,
+				runOutcome,
+				wallMs: Date.now() - loopStartedAt,
 			});
 			return {
 				outcome: "budget_exhausted",
@@ -440,7 +477,13 @@ export async function runWithIterations(
 		});
 
 		if (next === "done") {
-			finalizeRunRecord(ctx, { status: "completed", round, evaluation });
+			finalizeRunRecord(ctx, {
+				status: "completed",
+				round,
+				evaluation,
+				runOutcome,
+				wallMs: Date.now() - loopStartedAt,
+			});
 			return {
 				outcome: "verified",
 				finalRound: round,
@@ -457,6 +500,8 @@ export async function runWithIterations(
 				error: "aborted",
 				round,
 				evaluation,
+				runOutcome,
+				wallMs: Date.now() - loopStartedAt,
 			});
 			return {
 				outcome: "failed",
@@ -474,6 +519,8 @@ export async function runWithIterations(
 				error: message,
 				round,
 				evaluation,
+				runOutcome,
+				wallMs: Date.now() - loopStartedAt,
 			});
 			return {
 				outcome: "budget_exhausted",

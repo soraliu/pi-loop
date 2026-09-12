@@ -1,11 +1,14 @@
-// iterate 迭代引擎测试（M4-T2）
+// iterate 迭代引擎测试（M4-T2；M4-T3 补 telemetry 收尾用例）
 // 全脚本化 fake RPC + 临时 dataDir + 真 node -e 微脚本（verifyCommand 通道）——
 // 无真 spawn、无真网络（真实 critic/designer 链路归 e2e）。fake 按 spawn 任务文本
 // 分诊三类角色（designer=设计提示词 / critic=评审提示词 / 其他=计划步骤），各自
 // 维护脚本队列：designer 写实产文件（文件通道一次即成）、critic 按序回围栏结论、
 // 步骤按 spawn 序消费结局（缺省成功）——轮次行为完全可预测（Round 计数口径：0 起计）。
+// 另：执行层计划预算拒绝在自然流里不可达（designer 先行校验同一条预算上限，
+// 执行层闸是双保险）——该分支经 vi.mock 注入 executePlan 返回形覆盖（见顶部
+// rejectedOutcomes，与 extension.test.ts 的 outcomeOverrides 同手法）。
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,6 +18,7 @@ import {
 	type IterateAdapter,
 	type RoundEvent,
 } from "../src/core/iterate.ts";
+import type { RunOutcome } from "../src/core/orchestrator.ts";
 import type { DesignerOutcome } from "../src/core/designer.ts";
 import type {
 	EffortPreset,
@@ -23,6 +27,27 @@ import type {
 } from "../src/types.ts";
 import type { RunRecord } from "../src/storage/workspace.ts";
 import { createRunRecord, ensureWorkspace } from "../src/storage/workspace.ts";
+
+// ---------- executePlan 的返回形注入（M4-T3：空计划拒绝路径） ----------
+// vi.mock 对整个文件生效：wrapper 透传实际实现（既有用例零影响），仅当注入队列
+// 非空时按序消费其一绕过真实调度。vi.mock 工厂会被提升到文件顶部，引用的变量
+// 必须经 vi.hoisted 同样提升。
+const rejectedOutcomes = vi.hoisted(() => [] as RunOutcome[]);
+vi.mock("../src/core/orchestrator.ts", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../src/core/orchestrator.ts")>();
+	return {
+		...actual,
+		executePlan: (
+			plan: Parameters<typeof actual.executePlan>[0],
+			ctx: Parameters<typeof actual.executePlan>[1],
+		) => {
+			const override = rejectedOutcomes.shift();
+			if (override !== undefined) return Promise.resolve(override);
+			return actual.executePlan(plan, ctx);
+		},
+	};
+});
 
 /** 本文件创建的临时目录清单——afterAll 只清理这些（登记制） */
 const createdDirs: string[] = [];
@@ -71,6 +96,23 @@ function redesignPlan(): ResearchPlan {
 		steps: [
 			{ id: "probe", agent: "researcher", task: "换角度摸底", dependsOn: [] },
 			{ id: "report", agent: "researcher", task: "重构结论", dependsOn: [] },
+		],
+	};
+}
+
+/**
+ * 两步两 agent 计划（M4-T3：agents 去重口径的断言素材——entry 数多但去重后仅
+ * 2：survey=researcher / synth=writer）。无依赖：spawn 序确定 survey → synth。
+ */
+function twoAgentPlan(): ResearchPlan {
+	return {
+		version: 1,
+		task: PLAN_TASK,
+		origin: "designer",
+		notes: "两 agent 分工：摸底与综合",
+		steps: [
+			{ id: "survey", agent: "researcher", task: "摸底主流方案", dependsOn: [] },
+			{ id: "synth", agent: "writer", task: "综合对比结论", dependsOn: [] },
 		],
 	};
 }
@@ -590,5 +632,109 @@ describe("runWithIterations — 迭代闭环（SPEC §4）", () => {
 		expect(record.error).toBe("aborted");
 		expect(record.final).toEqual({ round: 0, verdict: "fail", score: 0 });
 		expect(record.evaluation?.reasons.join()).toContain("中止");
+		// M4-T3：预中止零 entry（层间检查点短路）→ 无执行事实，telemetry 整体
+		// omit（run.json 无该键，而非全零对象）
+		expect(record).not.toHaveProperty("telemetry");
+	});
+
+	it("telemetry 收尾落盘（M4-T3）：agents=全部轮次 entry 的 agent 去重、steps/succeeded/failed 按末轮、iterations 累计", async () => {
+		const ctx = setupRun();
+		ctx.fake.designerPlans = [twoAgentPlan()];
+		// 首轮 synth 失败（末轮口径对照素材：末轮两步全成，历史轮的失败不混入计数）
+		ctx.fake.stepOutcomes = [{}, { error: "综合崩溃" }];
+		ctx.fake.criticReplies = [
+			fenceEvaluation({
+				verdict: "fail",
+				score: 40,
+				reasons: ["综合不到位"],
+				blame: ["synth"],
+			}),
+			fenceEvaluation({
+				verdict: "verified",
+				score: 91,
+				reasons: ["补齐后达标"],
+				blame: [],
+			}),
+		];
+		const result = await runWithIterations(PLAN_TASK, presetOf(2), {
+			rpc: ctx.fake,
+			runId: ctx.runId,
+			dataDir: ctx.dataDir,
+		});
+
+		expect(result.outcome).toBe("verified");
+		expect(result.finalRound).toBe(1);
+		const record = readRecord(ctx);
+		// 两轮 × 两步 = 4 个 entry，agent 只有 researcher/writer 两个——去重计数为
+		// 2 而非 4；steps/succeeded 按末轮（首轮 synth 的失败不混入 failed）；iterations
+		// 为累计调度次数（M4-T3 落盘的对账点，与 LoopToolResult.telemetry 同口径）
+		expect(record.telemetry).toEqual({
+			steps: 2,
+			succeeded: 2,
+			failed: 0,
+			iterations: 4,
+			durationMs: expect.any(Number),
+			agents: 2,
+		});
+		// durationMs 为真实墙钟（fake 链路含毫秒级定时器，非零）
+		expect(record.telemetry?.durationMs).toBeGreaterThan(0);
+	});
+
+	it("全败至预算尽仍落 agents（spawn 过即有事实）；空计划拒绝零执行 → telemetry 整体 omit（不写假 0）", async () => {
+		// 场景一：两轮全部步骤失败 + verifyCommand 恒 exit 1 → 预算尽收尾——步
+		// 骤全败不抹去 spawn 事实：agents 照落（failed 为末轮真值）
+		const failedRun = setupRun();
+		failedRun.fake.designerPlans = [twoAgentPlan()];
+		failedRun.fake.stepOutcomes = [
+			{ error: "失败·摸底" },
+			{ error: "失败·综合" },
+			{ error: "失败·摸底" },
+			{ error: "失败·综合" },
+		];
+		const failed = await runWithIterations(PLAN_TASK, presetOf(1), {
+			rpc: failedRun.fake,
+			runId: failedRun.runId,
+			dataDir: failedRun.dataDir,
+			verifyCommand: `node -e "console.error('nope'); process.exit(1)"`,
+		});
+		expect(failed.outcome).toBe("budget_exhausted");
+		expect(failed.finalRound).toBe(1);
+		const failedRecord = readRecord(failedRun);
+		// 4 个 entry 全 failed、但 agent 去重后为 2——步骤失败与 agent 事实是两回事
+		expect(failedRecord.telemetry).toEqual({
+			steps: 2,
+			succeeded: 0,
+			failed: 2,
+			iterations: 4,
+			durationMs: expect.any(Number),
+			agents: 2,
+		});
+
+		// 场景二：执行层计划预算拒绝（零步骤执行零 entry）——自然流不可达，注入
+		// executePlan 返回形触发；无任何执行事实 → run.json 无 telemetry 键（诚实
+		// 遥测：缺省而非假 0）
+		const rejectedRun = setupRun();
+		rejectedRun.fake.designerPlans = [twoAgentPlan()];
+		rejectedOutcomes.push({
+			steps: 6,
+			succeeded: 0,
+			failed: 0,
+			durationMs: 0,
+			iterations: [],
+			batches: 0,
+			error: "budget_exhausted: plan steps 6 > max 5",
+		});
+		const rejected = await runWithIterations(PLAN_TASK, presetOf(2), {
+			rpc: rejectedRun.fake,
+			runId: rejectedRun.runId,
+			dataDir: rejectedRun.dataDir,
+		});
+		expect(rejected.outcome).toBe("budget_exhausted");
+		expect(rejected.error).toBe("budget_exhausted: plan steps 6 > max 5");
+		const rejectedRecord = readRecord(rejectedRun);
+		expect(rejectedRecord.status).toBe("failed");
+		expect(rejectedRecord.iterations).toEqual([]);
+		// omit 的真义：键不在场，而非全零对象
+		expect(rejectedRecord).not.toHaveProperty("telemetry");
 	});
 });

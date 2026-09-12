@@ -43,7 +43,11 @@ export interface LoopToolParams {
 	contextPaths?: string[];
 }
 
-/** Run 遥测（M2-T4 起由调度内核 RunOutcome 填充；stub 路径为全零占位） */
+/**
+ * Run 遥测（M2-T4 起由调度内核 RunOutcome 填充；stub 路径为全零占位；M4-T3
+ * 起随终态落盘 RunRecord.telemetry）。SPEC §5 的 turns 字段无从获得真实轮次
+ * 数据——诚实遥测：不可得字段 omit、不造假数值（对账见 docs/spec5-runrecord-gap.md）。
+ */
 export interface RunTelemetry {
 	/** 计划步骤总数 */
 	steps: number;
@@ -55,6 +59,12 @@ export interface RunTelemetry {
 	iterations: number;
 	/** 调度核心耗时（毫秒） */
 	durationMs: number;
+	/**
+	 * 真实 spawn 过的不同 agent 计数（M4-T3）：全部轮次 entry 的 agent 去重——同一
+	 * agent 多步多轮只计 1。诚实遥测：无执行事实（零 entry）时 omit 不写假 0——
+	 * 故为可选字段（stub 与拒绝路径不落键）。
+	 */
+	agents?: number;
 }
 
 /**

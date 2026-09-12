@@ -28,7 +28,7 @@ import {
   runLoopTask,
   runLoopTaskStub,
 } from "../src/extension/loop-task.ts";
-import type { LoopToolResult } from "../src/types.ts";
+import type { LoopToolResult, RunTelemetry } from "../src/types.ts";
 
 // ---------- executePlan 的 budget 注入捕获（M3-T5：M-1 收口）与返回形注入（M4-T0） ----------
 // vi.mock 对整个文件生效：wrapper 透传实际实现（既有用例零影响），只旁路记录
@@ -634,6 +634,7 @@ describe("runLoopTask 真实路径", () => {
         succeeded: 1,
         failed: 0,
         iterations: 1,
+        agents: 1,
         durationMs: expect.any(Number),
       });
       expect(result.error).toBeUndefined();
@@ -683,6 +684,7 @@ describe("runLoopTask 真实路径", () => {
           attempts?: number;
         };
         iterations: Array<Record<string, unknown>>;
+        telemetry?: RunTelemetry;
       };
       expect(record.plan).toMatchObject({
         origin: "builtin",
@@ -708,6 +710,27 @@ describe("runLoopTask 真实路径", () => {
         status: "succeeded",
         outputRef: "/runs/fake/research-transcript.md",
       });
+      // M4-T3：run.json telemetry 收尾落盘（agents=全轮 entry 的 agent 去重）+
+      // 工具结果面同口径对齐——确定性字段全等（steps/succeeded/failed/iterations/
+      // agents）；两面 durationMs 各自计时（run.json 为闭环内窗口，必不大于结果侧
+      // 全程）——诚实的两个测量点，不强行等值
+      expect(record.telemetry).toEqual({
+        steps: 1,
+        succeeded: 1,
+        failed: 0,
+        iterations: 1,
+        agents: 1,
+        durationMs: expect.any(Number),
+      });
+      expect(result.telemetry.steps).toBe(record.telemetry?.steps);
+      expect(result.telemetry.succeeded).toBe(record.telemetry?.succeeded);
+      expect(result.telemetry.failed).toBe(record.telemetry?.failed);
+      expect(result.telemetry.iterations).toBe(record.telemetry?.iterations);
+      expect(result.telemetry.agents).toBe(record.telemetry?.agents);
+      expect(record.telemetry?.durationMs).toBeGreaterThan(0);
+      expect(record.telemetry?.durationMs).toBeLessThanOrEqual(
+        result.telemetry.durationMs,
+      );
     } finally {
       restoreEnv(saved);
     }
@@ -775,6 +798,7 @@ describe("runLoopTask 真实路径", () => {
         error?: string;
         final?: { round: number; verdict: string; score: number };
         iterations: Array<{ error?: string; round?: number }>;
+        telemetry?: RunTelemetry;
       };
       expect(record.status).toBe("failed");
       expect(record.error).toContain("budget_exhausted:");
@@ -783,6 +807,17 @@ describe("runLoopTask 真实路径", () => {
       expect(record.iterations[0]?.error).toContain("请安装 pi-subagents");
       // 3 轮各 1 步：round 标注分轮归组
       expect(record.iterations.map((e) => e.round)).toEqual([0, 1, 2]);
+      // M4-T3：预算尽收尾的 telemetry 落盘——spawn 过（哪怕全败）即有 agent 事实
+      // （builtin 单步的 researcher 去重后=1），末轮口径与结果面同源
+      expect(record.telemetry).toEqual({
+        steps: 1,
+        succeeded: 0,
+        failed: 1,
+        iterations: 3,
+        agents: 1,
+        durationMs: expect.any(Number),
+      });
+      expect(result.telemetry.agents).toBe(1);
     } finally {
       restoreEnv(saved);
     }
@@ -814,6 +849,10 @@ describe("runLoopTask 真实路径", () => {
       ) as { status: string; error?: string };
       expect(record.status).toBe("failed");
       expect(record.error).toBe("aborted"); // T3 review M1 收口：run 级 abort 落痕
+      // M4-T3：零 entry（层间检查点短路）→ 无执行事实，run.json 整体 omit
+      // telemetry（不写假 0）；结果面同样不落 agents 键
+      expect(record).not.toHaveProperty("telemetry");
+      expect(result.telemetry).not.toHaveProperty("agents");
     } finally {
       restoreEnv(saved);
     }
@@ -1155,7 +1194,8 @@ describe("runLoopTask — 预算拒绝的枚举映射（M4-T0，终审 M-3 债�
     try {
       // executePlan 预算拒绝的返回形（orchestrator 侧 M3-T3 用例已锁定：零 spawn、
       // 零 entry、run 级 error 带 budget_exhausted: 前缀）——注入该形锁定 tool 层映射；
-      // run.json 断言不作（override 绕过了真实 executePlan 的落盘）
+      // M4-T3 起补 run.json 终态断言：override 只绕过 executePlan 的执行写入，
+      // 迭代引擎的 finalize 落盘照常发生（零执行事实 → telemetry 整体 omit）
       outcomeOverrides.push({
         steps: 3,
         succeeded: 0,
@@ -1191,6 +1231,19 @@ describe("runLoopTask — 预算拒绝的枚举映射（M4-T0，终审 M-3 债�
         iterations: 0,
         durationMs: expect.any(Number),
       });
+      // M4-T3：拒绝轮的 run.json 由迭代引擎 finalize 收口（failed + 拒绝原文留
+      // 档）；零 entry 即无执行事实——telemetry 整体 omit（键不在场，而非全零
+      // 对象），结果面同样不落 agents 键（诚实遥测不造假数值）
+      const record = JSON.parse(
+        fs.readFileSync(
+          path.join(tmp, "runs", result.runId, "run.json"),
+          "utf-8",
+        ),
+      ) as { status: string; error?: string };
+      expect(record.status).toBe("failed");
+      expect(record.error).toBe("budget_exhausted: plan steps 3 > max 2");
+      expect(record).not.toHaveProperty("telemetry");
+      expect(result.telemetry).not.toHaveProperty("agents");
     } finally {
       restoreEnv(saved);
     }

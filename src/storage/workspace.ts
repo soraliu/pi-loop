@@ -13,6 +13,7 @@ import type {
 	IterationEntry,
 	RunPlanInfo,
 	RunSummary,
+	RunTelemetry,
 } from "../types.ts";
 
 /** 生产环境默认数据根目录（~/.pi/loop/） */
@@ -34,6 +35,13 @@ export interface RunRecord extends RunSummary {
 	evaluation?: Evaluation;
 	/** 收尾摘要（M4-T2：终止时写——最终轮轮次与结论三键） */
 	final?: { round: number; verdict: Evaluation["verdict"]; score: number };
+	/**
+	 * 运行遥测（M4-T3：迭代闭环终止时随终态落盘）。steps/succeeded/failed 按末轮
+	 * 口径（与 LoopToolResult.telemetry 同源）、iterations 为累计调度次数、agents
+	 * 为全部轮次 entry 的 agent 去重计数；诚实遥测：零执行事实（无 entry 的拒绝/
+	 * 预中止路径）时整个块 omit，不写假 0。
+	 */
+	telemetry?: RunTelemetry;
 }
 
 /** run id：`r-<epoch36>` 加短随机后缀，防同毫秒碰撞且按创建时间天然有序 */
