@@ -29,6 +29,10 @@
 // 本引擎对一切非 verified 收尾如实留档（evaluation/final），不虚报通过。终态
 // telemetry 随收尾一并落盘（agents=/全轮 entry 去重计数 + 末轮口径计数——零执行
 // 事实时整个块 omit，不写假 0）。
+//
+// M5-T3 检索透传：IterateContext.retrieved 检索注入素材的透传管道——扩展层在 run
+// 头部（prepareRun 后、generatePlan 前）经 listMethods+listCases+retrieve 算好传入；
+// core 不做 IO 检索，首轮与重设计的 generatePlan 均透传同一份（run 内任务与库不变）。
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -41,6 +45,7 @@ import {
 	type RunOutcome,
 } from "./orchestrator.ts";
 import type { SubagentsRpcClient } from "./rpc.ts";
+import type { RetrievalResult } from "./retrieval.ts";
 import type { RunRecord } from "../storage/workspace.ts";
 import type {
 	Evaluation,
@@ -94,6 +99,14 @@ export interface IterateContext {
 	onUpdate?: (update: IterateUpdate) => void;
 	/** 机器验收命令（在场即唯一权威——零 critic spawn；blame 恒空导致重跑为原样重跑） */
 	verifyCommand?: string;
+	/**
+	 * 相似检索结果（M5-T3 检索连线）：扩展层在 prepareRun 后经 listMethods+listCases+
+	 * retrieve 算好传入（"下一次 run 时"的贯通线——上一 run 的入档发生在它的收尾，本轮的
+	 * 检索发生在头部，自引用不可能）。首轮与重设计的 generatePlan 均透传同一份（run
+	 * 内任务与库不变，不重复检索）；缺省 = 无注入（M4 行为不变），空检索（双列空）由
+	 * generatePlan 自然省略参考段（零成本路径）
+	 */
+	retrieved?: RetrievalResult;
 	/** 扩展层集成钩子（plan 元信息落盘等） */
 	adapter?: IterateAdapter;
 }
@@ -347,12 +360,17 @@ export async function runWithIterations(
 	const loopStartedAt = Date.now();
 
 	// ① 首轮设计（designer 自带降级链，不抛出）；plan 元信息交扩展层落盘
-	let designed = await generatePlan(task, preset, {
-		rpc: ctx.rpc,
-		runId: ctx.runId,
-		dataDir: ctx.dataDir,
-		signal: ctx.signal,
-	});
+	let designed = await generatePlan(
+		task,
+		preset,
+		{
+			rpc: ctx.rpc,
+			runId: ctx.runId,
+			dataDir: ctx.dataDir,
+			signal: ctx.signal,
+		},
+		ctx.retrieved,
+	);
 	const firstPlanBrief: LoopPlanBrief = {
 		origin: designed.plan.origin,
 		steps: designed.plan.steps.length,
@@ -535,12 +553,17 @@ export async function runWithIterations(
 		// ⑤ 下轮计划演化：重设计（fresh，不注入）或保留原 plan 注入归因（跳过
 		// designer 重生成——省预算且防设计漂移）
 		if (next === "redesign") {
-			designed = await generatePlan(task, preset, {
-				rpc: ctx.rpc,
-				runId: ctx.runId,
-				dataDir: ctx.dataDir,
-				signal: ctx.signal,
-			});
+			designed = await generatePlan(
+				task,
+				preset,
+				{
+					rpc: ctx.rpc,
+					runId: ctx.runId,
+					dataDir: ctx.dataDir,
+					signal: ctx.signal,
+				},
+				ctx.retrieved,
+			);
 			plan = designed.plan;
 			ctx.adapter?.onPlanDesigned?.(designed);
 			freshPlanRound = true;

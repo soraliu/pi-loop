@@ -6,6 +6,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { stringArray } from "../core/retrieval.ts";
 import type { IterateUpdate } from "../core/iterate.ts";
 import type { CommandContext, PiExtensionApi } from "./api.ts";
 import {
@@ -14,8 +15,17 @@ import {
   resolveDataDir,
   runLoopTask,
 } from "./loop-task.ts";
+import { listCases } from "../storage/cases.ts";
+import { listMethods } from "../storage/methods.ts";
 import { isEffortLevel } from "../storage/settings.ts";
-import type { EffortLevel, LoopToolParams, RunSummary } from "../types.ts";
+import { taskPreview } from "../storage/workspace.ts";
+import type {
+  Case,
+  EffortLevel,
+  LoopToolParams,
+  MethodologyEntry,
+  RunSummary,
+} from "../types.ts";
 
 /** /loop 参数的解析结果 */
 export interface ParsedLoopArgs {
@@ -133,12 +143,97 @@ export function listRecentRuns(dataDir: string): RunSummary[] {
   return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-/** 目录文件计数（/loop-cases、/loop-methods 的 stub 统计） */
-function countFiles(dir: string): number {
-  if (!fs.existsSync(dir)) return 0;
-  return fs
-    .readdirSync(dir)
-    .filter((name) => fs.statSync(path.join(dir, name)).isFile()).length;
+/** 列表命令(/loop-cases、/loop-methods)的 --limit 解析结果 */
+export interface ParsedLimitArgs {
+  /** 展示条数上限（缺省 10;正整数） */
+  limit: number;
+  /** 解析期发现的错误;非空时命令直接提示并不执行 */
+  error?: string;
+}
+
+/** 列表命令缺省展示条数 */
+const DEFAULT_LIST_LIMIT = 10;
+
+/**
+ * 解析列表命令参数文本(`--limit N`;其余文本忽略——列表命令无任务位，与 /loop 的解析
+ * 语义各自独立)。缺省 10;非正整数或缺值 → error 且 limit 置 0(哨兵值——error 路径的
+ * limit 不应被消费;若调用方误消费,0 只会得到空列表,不会以缺省值伪装成有效解析)。
+ */
+export function parseLimitArgs(raw: string): ParsedLimitArgs {
+  const tokens = raw.match(/"[^"]*"|\S+/g) ?? [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== "--limit") continue;
+    const value = tokens[i + 1]?.replace(/^"|"$/g, "");
+    if (value === undefined) {
+      return {
+        limit: 0,
+        error: "--limit 缺少值（如 --limit 5）",
+      };
+    }
+    const limit = Number(value);
+    if (!Number.isInteger(limit) || limit <= 0) {
+      return {
+        limit: 0,
+        error: `非法 --limit 值：${value}（正整数）`,
+      };
+    }
+    return { limit };
+  }
+  return { limit: DEFAULT_LIST_LIMIT };
+}
+
+/**
+ * id 的展示截断:列表行宽裁剪(超 12 字符截断加省略号;展示口径，档案文件名内仍是
+ * 完整 id——与 /loop-status 的运行 id 全显同源区分:案例/方法库量会增长，行宽提前留裕度)。
+ */
+function shortenId(id: string): string {
+  return id.length <= 12 ? id : `${id.slice(0, 12)}…`;
+}
+
+/** 数字字段的展示(缺形/非有限数 → ?——渲染 0 留给真实零实证，与 designer 参考段同口径) */
+function displayNumber(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? String(value)
+    : "?";
+}
+
+/** /loop-cases 单行:缩短 id + 验收徽标 + 评分 + 日期 + 任务截断 40 字(taskPreview 同款折叠/截断) */
+function describeCaseEntry(c: Case): string {
+  const score = displayNumber(c.finalScore);
+  const date =
+    (typeof c.createdAt === "string" ? c.createdAt : "").slice(0, 10) || "?";
+  const task = taskPreview(typeof c.task === "string" ? c.task : "", 40);
+  return [
+    shortenId(typeof c.id === "string" ? c.id : "?"),
+    `[${c.verified === true ? "已验收" : "未验收"}]`,
+    `score=${score}`,
+    date,
+    task,
+  ].join("  ");
+}
+
+/** /loop-methods 单行:id + 名称 + fitness 概要 + 适用面要点;防御读(与 designer 同口径) */
+function describeMethodEntry(m: MethodologyEntry): string {
+  const name =
+    typeof m.name === "string" && m.name.length > 0 ? m.name : "（未命名方法）";
+  const taskTypes = stringArray(m.appliesTo?.taskTypes);
+  const signals = stringArray(m.appliesTo?.signals);
+  const applies =
+    taskTypes.length === 0 && signals.length === 0
+      ? "适用面未声明"
+      : [
+          taskTypes.length > 0 ? `适用 ${taskTypes.join("、")}` : "",
+          signals.length > 0 ? `信号 ${signals.join("、")}` : "",
+        ]
+          .filter((part) => part.length > 0)
+          .join("；");
+  return [
+    shortenId(typeof m.id === "string" ? m.id : "?"),
+    name,
+    `uses=${displayNumber(m.fitness?.uses)}`,
+    `avgScore=${displayNumber(m.fitness?.avgScore)}`,
+    applies,
+  ].join("  ");
 }
 
 /**
@@ -262,26 +357,46 @@ export function registerLoopCommands(pi: PiExtensionApi): void {
   });
 
   pi.registerCommand("loop-cases", {
-    description: "查看案例档案统计（M5 接入后展示完整案例）",
-    handler: (_args: string, ctx: CommandContext) => {
+    description: "查看案例档案列表（用法：/loop-cases [--limit N]；默认 10）",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseLimitArgs(args);
+      if (parsed.error !== undefined) {
+        ctx.ui.notify(`参数错误: ${parsed.error}`, "error");
+        return;
+      }
       const dataDir = resolveDataDir();
-      const count = countFiles(path.join(dataDir, "cases"));
+      const cases = await listCases(dataDir, parsed.limit);
+      if (cases.length === 0) {
+        ctx.ui.notify(`尚无案例档案（${path.join(dataDir, "cases")}）`, "info");
+        return;
+      }
+      const lines = cases.map(describeCaseEntry);
       ctx.ui.notify(
-        `案例档案: ${count} 个文件（stub：案例存档在 M5 接入）`,
+        `最近 ${lines.length} 条案例:\n${lines.join("\n")}`,
         "info",
       );
     },
   });
 
   pi.registerCommand("loop-methods", {
-    description: "查看方法论库统计（M5 接入后展示方法条目）",
-    handler: (_args: string, ctx: CommandContext) => {
+    description: "查看方法论库条目（用法：/loop-methods [--limit N]；默认 10）",
+    handler: async (args: string, ctx: CommandContext) => {
+      const parsed = parseLimitArgs(args);
+      if (parsed.error !== undefined) {
+        ctx.ui.notify(`参数错误: ${parsed.error}`, "error");
+        return;
+      }
       const dataDir = resolveDataDir();
-      const count = countFiles(path.join(dataDir, "methods"));
-      ctx.ui.notify(
-        `方法论库: ${count} 个文件（stub：方法条目在 M5 接入）`,
-        "info",
-      );
+      const methods = (await listMethods(dataDir)).slice(0, parsed.limit);
+      if (methods.length === 0) {
+        ctx.ui.notify(
+          `尚无方法条目（${path.join(dataDir, "methods")}）`,
+          "info",
+        );
+        return;
+      }
+      const lines = methods.map(describeMethodEntry);
+      ctx.ui.notify(`方法库 ${lines.length} 条:\n${lines.join("\n")}`, "info");
     },
   });
 }
