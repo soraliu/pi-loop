@@ -181,13 +181,16 @@ function recordPlanInRunJson(
 }
 
 /**
- * run.json 悬留收口（M4-T0，M3 终审 M-4 债）：runLoopTask 的 catch 意味着异常发生在
- * executePlan 无法保证落盘的位置（designer 基建异常 / recordPlanInRunJson 读写失败 /
- * executePlan 受理前的上抛）——run 记录可能悬留非终态（status=created）。对照
- * executePlan 前置失败「先标 failed 再上抛」的既有治法，以同样的落盘格式（读改写、
- * 磁盘为事实源）补齐：只收口非终态（created/running——executePlan 已自标 failed 的
- * 路径不覆盖），error 字段落异常摘要供审计。兜底自身的失败（run.json 损坏/不可写）
- * 静默吞掉——绝不掩盖原异常。
+ * run.json 悬留收口（M4-T0，M3 终审 M-4 债；M5-T1 补 M4 终审 M-1）：runLoopTask 的
+ * catch 意味着异常发生在闭环收尾（finalizeRunRecord）无法保证执行的位置（designer
+ * 基建异常 / recordPlanInRunJson 读写失败 / executePlan 先标终态后上抛 / finalize
+ * 落盘前的任意异常）——run 记录可能悬留非终态（status=created），也可能悬留陈旧
+ * 终态。对照 executePlan 前置失败「先标 failed 再上抛」的既有治法，以同样的落盘格式
+ * （读改写、磁盘为事实源）补齐。放过判据（M-1 修正）：仅「终态 且 final 已在场」
+ * 是可信终态——finalize 落盘时 final 与终态 status 同写一份 JSON，是闭环完整收尾的
+ * 物证；终态但 final 缺席 = 陈旧终态窗（mid-loop 基建异常——executePlan 的 finally
+ * 先标终态后上抛一类），与 created/running 同样收口 failed，error 字段落异常摘要供
+ * 审计。兜底自身的失败（run.json 损坏/不可写）静默吞掉——绝不掩盖原异常。
  */
 function markRunFailedInRunJson(
   dataDir: string,
@@ -200,7 +203,10 @@ function markRunFailedInRunJson(
     const record = JSON.parse(fs.readFileSync(file, "utf-8")) as RunRecord & {
       error?: string;
     };
-    if (record.status !== "created" && record.status !== "running") return;
+    // 放过判据（M-1）：终态 + final 在场才可信（迭代引擎 finalize 的完整收尾）——
+    // 终态但 final 缺席（陈旧终态窗）与非终态（created/running）同样收口 failed
+    const terminal = record.status !== "created" && record.status !== "running";
+    if (terminal && record.final !== undefined) return;
     record.status = "failed";
     record.error = message;
     fs.writeFileSync(file, JSON.stringify(record, null, "\t") + "\n");

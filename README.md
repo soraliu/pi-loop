@@ -149,7 +149,10 @@ evaluate → 注入 → 重跑 闭环落地。
   结论，最后一轮 `evaluation` 与 `final` 留档——partial/fail 不丢、不虚报通过。
 - **物证留档**：run.json 新增 `round`（当前轮）、`evaluation`（最终轮结论：
   verdict / score / reasons / blame）与 `final`（收尾摘要：round / verdict /
-  score）；工具结果与 `/loop` 收尾通知同步携带 evaluation 摘要。
+  score）；工具结果与 `/loop` 收尾通知同步携带 evaluation 摘要；终态另落 `telemetry`
+  遥测块——`agents` 为各轮次 entry 的 agent 去重计数、`steps`/`succeeded`/`failed`
+  按末轮口径、`iterations` 为累计调度次数、`durationMs` 为闭环墙钟；零执行事实
+  （空计划拒绝/预中止）时整个块 omit——不写假 0，`turns` 无真实数据恒不落。
 
 `/loop --verify`（等价于 `loop_task` 的 `verifyCommand` 入参）用法：
 

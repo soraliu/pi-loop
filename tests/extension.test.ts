@@ -33,7 +33,8 @@ import type { LoopToolResult, RunTelemetry } from "../src/types.ts";
 // ---------- executePlan 的 budget 注入捕获（M3-T5：M-1 收口）与返回形注入（M4-T0） ----------
 // vi.mock 对整个文件生效：wrapper 透传实际实现（既有用例零影响），只旁路记录
 // runLoopTask → executePlan 的 ctx.budget——T4 报告申报的捕获型断言在此兑现；
-// M4-T0 另增 outcomeOverrides 返回形注入队列（预算拒绝形态的 tool 层枚举映射用例）。
+// M4-T0 另增 outcomeOverrides 返回形注入队列（预算拒绝形态的 tool 层枚举映射用例；
+// M5-T1 又增 staleTerminalSeeds 陈旧终态注入队列——见下方声明处注释）。
 // vi.mock 工厂会被提升到文件顶部，引用的变量必须经 vi.hoisted 同样提升
 const budgetCaptures = vi.hoisted(
   () =>
@@ -43,18 +44,37 @@ const budgetCaptures = vi.hoisted(
 );
 /** executePlan 的返回形注入队列（非空时按序消费其一，绕过真实调度；空则透传真实现） */
 const outcomeOverrides = vi.hoisted(() => [] as RunOutcome[]);
+/** executePlan 的陈旧终态注入队列（M5-T1：M-1 补丁用例——非空时按序消费其一，
+ * 先把 run.json 标成给定终态（仿真真实 orchestrator 的 finally「先标终态后上抛」）
+ * 再上抛，仿真迭代引擎 finalize（final/evaluation 落盘）之前的 mid-loop 基建异常） */
+const staleTerminalSeeds = vi.hoisted(
+  () => [] as Array<{ status: "completed" | "failed"; error: Error }>,
+);
 vi.mock("../src/core/orchestrator.ts", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../src/core/orchestrator.ts")>();
   return {
     ...actual,
-    executePlan: (
+    executePlan: async (
       plan: Parameters<typeof actual.executePlan>[0],
       ctx: Parameters<typeof actual.executePlan>[1],
     ) => {
       budgetCaptures.push(ctx.budget);
+      const stale = staleTerminalSeeds.shift();
+      if (stale !== undefined) {
+        // 读改写 run.json（真实实现的同款落盘格式）——只改 status，随后上抛
+        const fs = await import("node:fs");
+        const path = await import("node:path");
+        const file = path.join(ctx.dataDir, "runs", ctx.runId, "run.json");
+        const record = JSON.parse(fs.readFileSync(file, "utf8")) as {
+          status: string;
+        };
+        record.status = stale.status;
+        fs.writeFileSync(file, JSON.stringify(record, null, "\t") + "\n");
+        throw stale.error;
+      }
       const override = outcomeOverrides.shift();
-      if (override !== undefined) return Promise.resolve(override);
+      if (override !== undefined) return override;
       return actual.executePlan(plan, ctx);
     },
   };
@@ -1394,6 +1414,49 @@ describe("runLoopTask — 迭代闭环接线（M4-T2）", () => {
         score: 88,
       });
       expect(record.iterations.map((e) => e.round)).toEqual([0, 0, 1, 1]);
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+});
+
+// ---------- M5-T1：M-1 补丁（M4 终审）——陈旧终态窗收口 ----------
+describe("runLoopTask — 陈旧终态窗收口（M5-T1，M4 终审 M-1）", () => {
+  it("终态 completed 但 final 缺席（executePlan 先标终态后上抛的 mid-loop 基建异常）→ 不再被终态放过：收口 failed + error 摘要", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      // 仿真陈旧终态窗：executePlan 的 finally 已把 run.json 标成 completed
+      //（计划全部执行完的终态落盘），随后迭代引擎在 finalize（evaluation/final
+      // 落盘）之前上抛基建异常——老判据「终态即放过」会放过这一窗
+      staleTerminalSeeds.push({
+        status: "completed",
+        error: new Error("评估落盘前的 I/O 基建故障"),
+      });
+      const result = await runLoopTask(
+        { task: "陈旧终态窗任务" },
+        { busEnv: makeFakeSubagentsBus() },
+      );
+      // 统一收敛 failed + 可读 error（既有语义保持——不向宿主抛裸异常）
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("I/O 基建故障");
+      expect(result.summary).toContain("执行链异常");
+      // M-1 兑现：终态但 final 缺席的陈旧窗被收口——run.json 落 failed + error
+      // 摘要，绝不让「没有收尾结论的 completed」冒充完成（诚实遥测）
+      const record = JSON.parse(
+        fs.readFileSync(
+          path.join(tmp, "runs", result.runId, "run.json"),
+          "utf-8",
+        ),
+      ) as {
+        status: string;
+        error?: string;
+        final?: unknown;
+      };
+      expect(record.status).toBe("failed");
+      expect(record.error).toContain("I/O 基建故障");
+      // 收口只落 failed + error——不伪造 final/evaluation（闭环从未收尾）
+      expect(record.final).toBeUndefined();
     } finally {
       restoreEnv(saved);
     }

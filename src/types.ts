@@ -234,3 +234,89 @@ export interface Evaluation {
 	/** 归因 stepId 列表：critic 通道来自 critic 指认（已过滤不存在的 id）；verifyCommand 机器断言通道恒为空数组——退出码没有轮次归因概念（细节在 reasons） */
 	blame: string[];
 }
+
+/* ================================================================
+ * 方法论库与案例档案（M5-T1：SPEC §5 的 MethodologyEntry / Case 落档根基）
+ * ================================================================ */
+
+/**
+ * 方法条目的计划模板（SPEC §5 playbook——计划骨架与提示词模板的精简形）。
+ * 步骤骨架与 PlanStep 的字段子集对齐（agent/task；acceptanceHint 对应
+ * PlanStep.acceptance 的模板位），供 designer 注入与 M6 Meta-loop 修订消费。
+ */
+export interface PlaybookTemplate {
+	/** 步骤骨架（有序；依赖关系在 taskHint 文本说明，v1 不结构化） */
+	steps: Array<{
+		/** 执行本步的 subagent 角色名（PlanStep.agent 同语义） */
+		agent: string;
+		/** 任务提示词模板（可含 {task} 占位符——注入时替换为任务原文） */
+		taskHint: string;
+		/** 验收提示（可选——PlanStep.acceptance 的模板位） */
+		acceptanceHint?: string;
+	}>;
+	/** 模板备注（适用边界/使用要领） */
+	notes?: string;
+}
+
+/**
+ * 方法条目（SPEC §5：方法论库的结构化策略资产——git 版本化，见 src/storage/methods.ts）。
+ * v1 适配：lineage.diff 以 notes 文字承载（结构化 diff 属 M6 Meta-loop 的演进项）。
+ */
+export interface MethodologyEntry {
+	/** 条目唯一 id（即 methods/<id>.json 文件名） */
+	id: string;
+	/** 方法名（人类可读） */
+	name: string;
+	/** 适用面声明（M5-T2 相似检索的评分输入） */
+	appliesTo: {
+		/** 适用任务类型 */
+		taskTypes: string[];
+		/** 触发信号关键词 */
+		signals: string[];
+	};
+	/** 计划模板（SPEC §5：可含提示词骨架） */
+	playbook: PlaybookTemplate;
+	/** 适配度统计（真实 run 结果驱动——平滑累计数学见 updateFitness） */
+	fitness: {
+		/** 累计使用次数 */
+		uses: number;
+		/** 历次 score 的平滑累计均值（0-100） */
+		avgScore: number;
+	};
+	/** 谱系（parent=来源条目 id；notes=修订说明——SPEC §5 的 diff 文字承载） */
+	lineage: {
+		parent?: string;
+		notes?: string;
+	};
+	/** 最后更新时间（ISO 8601） */
+	updatedAt: string;
+}
+
+/**
+ * 案例档案（SPEC §5：task、检索方法、plan、结果、评分、教训）。
+ * v1 适配（M4 终审定案「Case 消费规范」）：plan 存摘要非全文（origin/steps/notes），
+ * methodIds 恒空数组（方法关联自 plan 追溯属 M6）——conversion 见
+ * src/storage/cases.ts 的 caseFromRunRecord。
+ */
+export interface Case {
+	/** 案例唯一 id（时间戳+随机后缀——runId 风格，即 cases/<id>.json 文件名） */
+	id: string;
+	/** 任务全文（loop_task 的 task 入参） */
+	task: string;
+	/** 关联方法条目 id（v1 恒空——方法关联 M6 接通） */
+	methodIds: string[];
+	/** 计划来源（builtin/designer 二分——v1 的方法关联近似） */
+	origin: "designer" | "builtin";
+	/** 计划摘要（SPEC §5 plan 的精简形：步数与备注；全文在 run.json / designer-plan.json） */
+	plan: { steps: number; notes?: string };
+	/** 来源 run 记录 id（run 兼作任务标识——M4-T3 定案 taskId=runId 兼用） */
+	runId: string;
+	/** 最终评分（final 在场时才有——final.verdict 对应轮的 score） */
+	finalScore?: number;
+	/** 是否验收通过（final.verdict === "verified"——final 缺席恒 false） */
+	verified: boolean;
+	/** 教训（末轮评估 reasons 摘前 3 条；异常终止追加标记） */
+	lessons: string[];
+	/** 案例创建时间（ISO 8601） */
+	createdAt: string;
+}
