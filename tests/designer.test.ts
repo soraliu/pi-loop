@@ -656,6 +656,31 @@ const RETRIEVED_CASE_FAIL: Case = {
 	createdAt: "2026-09-13T00:00:00.000Z",
 };
 
+/**
+ * 缺形方法条目（Fix round 1 I 锁定形态：缺 taskTypes、缺 fitness）：
+ * listMethods 仅顶层校验——缺形磁盘 JSON 可越过类型进榜（retrieval 防御读
+ * 放行"signals 命中"的条目）；as unknown 双跳模拟该真实运行时形态
+ */
+const MALFORMED_METHOD = {
+	id: "m-broken",
+	name: "缺形方法",
+	appliesTo: { signals: ["研究", "改进"] },
+	playbook: { steps: [] },
+	lineage: {},
+	updatedAt: "2026-09-13T00:00:00.000Z",
+} as unknown as MethodologyEntry;
+
+/** 缺形案例（缺 plan 摘要与 lessons）——同上口径的 as unknown 双跳 */
+const MALFORMED_CASE = {
+	id: "c-broken",
+	task: "研究并改进代码评审的流程",
+	methodIds: [],
+	origin: "designer",
+	runId: "r-broken",
+	finalScore: 40,
+	verified: false,
+} as unknown as Case;
+
 describe("generatePlan — M5-T2 检索注入面", () => {
 	it("注入在场：prompt 含方法名/适用面/fitness 概要 + 案例摘要/结果/教训 + 参考语；段位次=用户任务后、预算约束前；schema/产物语义不变", async () => {
 		const { dataDir, runId, planFile } = setupRun();
@@ -760,5 +785,57 @@ describe("generatePlan — M5-T2 检索注入面", () => {
 		expect(bareText).not.toContain("【参考方法/案例");
 		expect(bareText).not.toContain("仅作方法参考");
 		expect(bareText).not.toContain("不要照搬");
+	});
+
+	it("Fix-I 缺形方法（缺 taskTypes/fitness）→ 不抛不崩：generatePlan 照常完成，条目渲染且无 undefined 字样", async () => {
+		const { dataDir, runId, planFile } = setupRun();
+		const fake = new FakeRpc().script({
+			preComplete: () => fs.writeFileSync(planFile, JSON.stringify(goodPlan())),
+		});
+		// 修复前：method.appliesTo.taskTypes.length / method.fitness.uses 同步抛 TypeError，
+		// 击穿降级链（iterate.ts 的「designer 自带降级不抛」契约）
+		const outcome = await generatePlan(
+			TASK,
+			PRESET,
+			{ rpc: fake, runId, dataDir },
+			{ methods: [MALFORMED_METHOD], cases: [] },
+		);
+		expect(outcome).toMatchObject({
+			attempts: 1,
+			degraded: false,
+			channel: "file",
+		});
+		const text = fake.spawns[0].task ?? "";
+		// 缺形方法行：taskTypes 要点空态省略，fitness 显示 ?
+		expect(text).toContain(
+			"- 缺形方法（信号 研究、改进；已用 ? 次、评估均分 ?）",
+		);
+		// 渲染无 undefined 字样
+		expect(text).not.toContain("undefined");
+	});
+
+	it("Fix-I 缺形案例（缺 plan/lessons）→ 不抛不崩：task 摘照常、计划 ? 步、教训暂无", async () => {
+		const { dataDir, runId, planFile } = setupRun();
+		const fake = new FakeRpc().script({
+			preComplete: () => fs.writeFileSync(planFile, JSON.stringify(goodPlan())),
+		});
+		// 修复前：c.plan.steps / c.lessons.slice 同步抛——同一条崩溃链
+		const outcome = await generatePlan(
+			TASK,
+			PRESET,
+			{ rpc: fake, runId, dataDir },
+			{ methods: [RETRIEVED_METHOD], cases: [MALFORMED_CASE] },
+		);
+		expect(outcome).toMatchObject({
+			attempts: 1,
+			degraded: false,
+			channel: "file",
+		});
+		const text = fake.spawns[0].task ?? "";
+		// 缺形案例行：plan.steps 缺显示 ?，lessons 缺按空态省略，无 undefined
+		expect(text).toContain("任务：研究并改进代码评审的流程");
+		expect(text).toContain("未验收，评分 40，计划 ? 步");
+		expect(text).toContain("教训：暂无");
+		expect(text).not.toContain("undefined");
 	});
 });

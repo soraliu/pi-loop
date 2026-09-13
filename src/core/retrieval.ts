@@ -94,8 +94,11 @@ function dice(a: Set<string>, b: Set<string>): number {
 	return (2 * hits) / (a.size + b.size);
 }
 
-/** 字符串数组的防御读取（listMethods 不做深校验——磁盘 JSON 缺形时按空处理，不抛） */
-function stringArray(value: unknown): string[] {
+/**
+ * 字符串数组的防御读取（listMethods/listCases 只做顶层校验——磁盘 JSON 缺形
+ * 时按空处理不抛；designer 注入渲染层共用同一口径）。
+ */
+export function stringArray(value: unknown): string[] {
 	return Array.isArray(value)
 		? value.filter((item): item is string => typeof item === "string")
 		: [];

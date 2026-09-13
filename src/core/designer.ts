@@ -33,6 +33,7 @@ import {
 import { isNoReplyTimeout } from "./orchestrator.ts";
 import { validateResearchPlan } from "./plan-schema.ts";
 import { BUILTIN_PLAN } from "./planner-static.ts";
+import { stringArray } from "./retrieval.ts";
 import type { RetrievalResult } from "./retrieval.ts";
 import type { SubagentsRpcClient } from "./rpc.ts";
 import type { EffortPreset, ResearchPlan } from "../types.ts";
@@ -183,12 +184,24 @@ function summariseCaseTask(task: string): string {
 		: `${task.slice(0, CASE_TASK_SUMMARY_LIMIT)}…`;
 }
 
+/** 渲染层计数：缺形/非有限数显示 ?（防御读不折为 0——渲染 0 留给真实零实证） */
+function displayCount(value: unknown): string {
+	return typeof value === "number" && Number.isFinite(value)
+		? String(value)
+		: "?";
+}
+
 /**
  * 「参考方法/案例」段（M5-T2 注入面）：过往沉淀的相似方法与案例渲染进提示词。
  * 防过拟合口径：标题与正文双重明示「仅作方法参考，按本任务特点设计」——designer
  * 不得把参考方法/旧案例当模板照抄（旧计划的步骤划分与措辞未必适配新任务）。
  * 每方法一行（name + 适用面要点 + fitness 概要）；每案例三行（task 摘 +
  * verified/评分/计划步数 + lessons 摘前 2 条）。
+ * 缺形防御（Fix round 1 I）：listMethods/listCases 仅顶层校验，缺形条目可经
+ * retrieval 防御读放行进榜（signals 命中的 task 文本仍在）——payload 在这里
+ * 的任何字段访问都镜像 retrieval 口径（stringArray / ?. / === true / typeof），
+ * 任何缺形不抛不崩：不得击穿 generatePlan 的降级链（iterate 的「designer 不抛」
+ * 契约）；缺形要点空态省略、缺 fitness/plan.steps 显示 ?，绝不渲染 undefined 字样。
  * retrieved 缺省或双列皆空 → 返回 undefined：模板整体不加该段（M3 行为逐字节不变
  * ——回归锚；零命中时调用方本就应省略注入）。
  */
@@ -205,29 +218,41 @@ function buildReferenceSection(
 	if (methods.length > 0) {
 		lines.push("相似方法：");
 		for (const method of methods) {
+			// 防御读：缺 taskTypes/signals 的要点空态省略；缺 fitness 显示 ?
+			const taskTypes = stringArray(method.appliesTo?.taskTypes);
+			const signals = stringArray(method.appliesTo?.signals);
 			const traits: string[] = [];
-			if (method.appliesTo.taskTypes.length > 0) {
-				traits.push(`适用 ${method.appliesTo.taskTypes.join("、")}`);
+			if (taskTypes.length > 0) {
+				traits.push(`适用 ${taskTypes.join("、")}`);
 			}
-			if (method.appliesTo.signals.length > 0) {
-				traits.push(`信号 ${method.appliesTo.signals.join("、")}`);
+			if (signals.length > 0) {
+				traits.push(`信号 ${signals.join("、")}`);
 			}
 			traits.push(
-				`已用 ${method.fitness.uses} 次、评估均分 ${method.fitness.avgScore}`,
+				`已用 ${displayCount(method.fitness?.uses)} 次、评估均分 ${displayCount(method.fitness?.avgScore)}`,
 			);
-			lines.push(`- ${method.name}（${traits.join("；")}）`);
+			const name =
+				typeof method.name === "string" && method.name.length > 0
+					? method.name
+					: "（未命名方法）";
+			lines.push(`- ${name}（${traits.join("；")}）`);
 		}
 	}
 	if (cases.length > 0) {
 		lines.push("过往案例：");
 		for (const c of cases) {
+			// 同口径防御：缺 plan.steps 显示 ?；缺 lessons 按空态省略
 			const outcome = [
-				c.verified ? "已验收" : "未验收",
-				c.finalScore === undefined ? "无评分" : `评分 ${c.finalScore}`,
-				`计划 ${c.plan.steps} 步`,
+				c.verified === true ? "已验收" : "未验收",
+				typeof c.finalScore === "number" && Number.isFinite(c.finalScore)
+					? `评分 ${c.finalScore}`
+					: "无评分",
+				`计划 ${displayCount(c.plan?.steps)} 步`,
 			].join("，");
-			const lessons = c.lessons.slice(0, 2).join("；");
-			lines.push(`- 任务：${summariseCaseTask(c.task)}`);
+			const lessons = stringArray(c.lessons).slice(0, 2).join("；");
+			const task =
+				typeof c.task === "string" && c.task.length > 0 ? c.task : "（无任务记录）";
+			lines.push(`- 任务：${summariseCaseTask(task)}`);
 			lines.push(`  结果：${outcome}`);
 			lines.push(`  教训：${lessons.length > 0 ? lessons : "暂无"}`);
 		}

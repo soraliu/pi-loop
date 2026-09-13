@@ -236,6 +236,19 @@ describe("retrieve — 案例任务相似度（Dice）与 verified 加成", () =
 		const result = retrieve(task, { methods: [], cases: [far, good, weak] });
 		expect(result.cases.map((c) => c.id)).toEqual(["c-good", "c-weak"]);
 	});
+
+	it('Dice 防"短案例霸榜"：短案例全嵌长任务（单向 containment=1.0）不压过高重合案例（Fix-M 选型论据锁定）', () => {
+		// 任务 11 特征：{研究 究并 并改 改进 进代 代码 码评 评审 审的 的流 流程}
+		const task = "研究并改进代码评审的流程";
+		// 短案例（2 字）仅 1 特征"改进"——单向 contain(case→task)=1.0（若用单向
+		// containment 计分会满分霸榜——既有用例两集大小相等，Dice≡containment
+		// 区分不出）；Dice 对称口径 2/12≈0.17，即便 verified+0.1 也只 0.27。
+		// 高重合案例 7 特征命中 6，dice 12/18≈0.67——稳压前者
+		const short = makeCase("c-short", "改进", true);
+		const rich = makeCase("c-rich", "研究改进代码评审");
+		const result = retrieve(task, { methods: [], cases: [short, rich] });
+		expect(result.cases.map((c) => c.id)).toEqual(["c-rich", "c-short"]);
+	});
 });
 
 describe("retrieve — k 截断与并列序（缺省 k=3）", () => {
