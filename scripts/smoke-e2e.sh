@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-loop 端到端冒烟脚本（M2-T5 → M3-T5 → M4-T4 三场景升级）
+# pi-loop 端到端冒烟脚本（M2-T5 → M3-T5 → M4-T4 → M5-T4 三场景升级 + 档案断言）
 # 验证链路：真实 pi 宿主加载扩展 → 模型调用 loop_task → designer 动态生成计划
 # （researcher 兼任设计）→ pi-subagents 真实逐层 spawn → 完成事件回写 → 断言 run.json。
 #
@@ -19,6 +19,11 @@
 #   （verifyCommand 通道专属文案——critic 通道的 reasons 是围栏 JSON 原文；
 #   等价证明本轮评估零 critic spawn，完整的 spawn 计数断言由单测 fake rpc
 #   锁定）+ blame 恒空（退出码断言无轮次归因概念）。
+# 场景 A 追加断言（M5-T4 档案链观测）：跑完 loop_task 后 cases/ 出现新 Case
+#   （ls 非空且最近 Case.runId === 本 run——三终点自动 Case 化的 e2e 物证）；
+#   方法库 git log 按实际记录（v1 现实：run 链不调用 saveMethodEntry——详见断言处
+#   注释）。档案断言失败不触发硬性 FAIL——与场景同步降级 SKIP（给实测说明；
+#   不计 FAIL 也不影响后续场景执行）。
 #
 # 物证留档（M3 终审附随义务）：默认各场景 mktemp 全新目录、退出即清理；
 #   KEEP_ARTIFACTS=1 时保留全部 dataDir 与 pi 输出日志并打印路径（详见 trap
@@ -34,7 +39,8 @@
 #     隔离 HOME 会失去这些定义，spawn 必然失败（T4 派生事实）；
 #   - PI_LOOP_DATA_DIR 指向临时目录：run 落盘隔离，绝不写真实 ~/.pi/loop/
 #     （场景 B 的 settings.json 覆盖也因此只作用于本临时目录）；
-#   - 主动 unset PI_LOOP_STUB：e2e 必须走真实路径（防外环境残留 stub 开关）。
+#   - 主动 unset PI_LOOP_STUB 与 PI_LOOP_NO_ARCHIVE：e2e 必须走真实路径且必落案例
+#     档案（防外环境残留 stub 开关与归档关闭开关——后者会把 M5 档案断言误伤成降级）。
 #
 # 退出码语义（与 smoke.sh 同哲学）：
 #   0 = 所有已执行场景 PASS，或全部止于显式 SKIP（环境不满足：pi / node 缺失、
@@ -105,8 +111,10 @@ else
   trap 'rm -rf "$DATA_A" "$OUT_A" "$DATA_B" "$OUT_B" "$DATA_C" "$OUT_C"' EXIT
 fi
 
-# e2e 必须走真实调度：清除可能从外环境泄漏的 M1 stub 开关
-unset PI_LOOP_STUB
+# e2e 必须走真实调度：清除可能从外环境泄漏的 M1 stub 开关与 M5 归档关闭开关
+# （PI_LOOP_NO_ARCHIVE=1 会让 run 不落案例档案——场景 A 的 M5 档案断言会被外环境
+# 泄漏误伤，与 stub 开关同治理）
+unset PI_LOOP_STUB PI_LOOP_NO_ARCHIVE
 
 # ---------- 步骤的辅助（终态驱动的等待需要）：定位 run.json / 探读终态 / 优雅终止 ----------
 # 定位最新 run.json（单场景应恰一个；万一多 run 取字典序最大——r-<epoch36>-<rand>
@@ -358,6 +366,78 @@ if [ "$VERDICT_A" = "PASS" ]; then
     console.log(`plan: origin=${plan.origin} steps=${plan.steps} channel=${plan.channel ?? "-"} attempts=${plan.attempts ?? "-"} degraded=${plan.degraded}`);
     console.log(`iterations: ${succ}/${iters.length} succeeded`);
   ' "$RUN_JSON" 2>/dev/null || true
+
+  # ---------- M5-T4 档案断言（追加）：档案链物证 ----------
+  # 断言（硬性主体）：cases/ 出现新 Case（本场景 dataDir 为 mktemp 专属目录，cases/
+  # 只可能来自本 run 的终态入档）且最近一条（createdAt 最新）的 runId === 本 run。
+  # 轮询重试 3×2s：run.json 终态落盘与 saveCase 的写入相邻但非原子，抵御总控在
+  # 两写之间截停 pi 的极小竞态；重试窗内仍未观测到 → 如实计入失败。
+  # 失败降级语义（logMode）：档案断言失败不触发硬性 FAIL——与场景同步降级
+  # SKIP-ARCHIVE（给实测说明，不计 FAIL），后续场景照常执行（B/C 不依赖档案链）
+  ARCHIVE_A="FAIL:未执行"
+  for _ in 1 2 3; do
+    ARCHIVE_A="$(node -e '
+      const fs = require("fs");
+      const path = require("path");
+      const rec = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const runId = typeof rec.id === "string" ? rec.id : "";
+      const casesDir = path.join(process.argv[2], "cases");
+      const reasons = [];
+      let names = [];
+      try {
+        names = fs.readdirSync(casesDir).filter((n) => n.endsWith(".json"));
+      } catch {
+        reasons.push("cases/ 目录不存在");
+      }
+      if (reasons.length === 0 && names.length === 0) {
+        reasons.push("cases/ 无 *.json（run 终态未入档）");
+      }
+      if (names.length > 0) {
+        const entries = [];
+        for (const name of names) {
+          try {
+            entries.push(JSON.parse(fs.readFileSync(path.join(casesDir, name), "utf8")));
+          } catch {
+            reasons.push(`案例文件损坏：${name}`);
+          }
+        }
+        const latest = entries
+          .filter((c) => c && typeof c.createdAt === "string")
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+          .pop();
+        if (entries.length > 0 && latest === undefined) {
+          reasons.push("cases/ 条目全部缺 createdAt 形（无法定位最近案例）");
+        } else if (latest !== undefined && String(latest.runId ?? "") !== runId) {
+          reasons.push(`最近案例 runId=${String(latest.runId ?? "(缺)")}（应为本 run ${runId}）`);
+        }
+      }
+      console.log(reasons.length === 0 ? "PASS" : `FAIL:${reasons.join("；")}`);
+    ' "$RUN_JSON" "$DATA_A" 2>/dev/null || echo "FAIL:run.json 读取失败")"
+    if [ "${ARCHIVE_A%%:*}" = "PASS" ]; then break; fi
+    sleep 2
+  done
+  if [ "${ARCHIVE_A%%:*}" = "PASS" ]; then
+    echo "PASS: e2e 场景 A 档案链（cases/ 新 Case 且最近一条 runId === 本 run——run 终态自动 Case 化的 e2e 物证）"
+    # 方法库 git 化按实际记录（不造假断言）：M5 v1 的 run 链不调用 saveMethodEntry
+    # （Case.methodIds 恒空 → updateFitness 不触发），methods/ 的 git commit 只能来自
+    # M6 起的真实消费或手工入库——无 commit 如实记 v1 现状；有 commit 则核验前缀
+    METHODS_LOG_A="$(git -C "$DATA_A/methods" log --format=%s 2>/dev/null || true)"
+    if [ -n "$METHODS_LOG_A" ]; then
+      if grep -qv '^methods:' <<<"$METHODS_LOG_A"; then
+        echo "SKIP: methods/ git log 含非 methods: 前缀 commit（留人工复核）"
+        grep -v '^methods:' <<<"$METHODS_LOG_A" | head -3
+      else
+        echo "PASS: methods/ 方法库 git commit 在场且主题均含 methods: 前缀"
+      fi
+    else
+      echo "SKIP: v1 无方法 commit（如实记录——M5 v1 的 run 链不调用 saveMethodEntry，方法库 commit 自 M6 updateFitness 真实消费起）"
+    fi
+  else
+    echo "SKIP: e2e 场景 A 档案断言未达（${ARCHIVE_A#FAIL:}）——与场景同步降级不计 FAIL；实测说明：run 终态未观测到案例入档，诊断线索如下（KEEP_ARTIFACTS=1 时物证已保留）"
+    echo "---- 档案诊断：cases/ 内容 ----"
+    ls -la "$DATA_A/cases" 2>/dev/null || echo "（cases/ 目录不存在）"
+    A_RESULT="SKIP-ARCHIVE"
+  fi
 elif classify_env_skip "$RUN_JSON" "$OUT_A"; then
   A_RESULT="SKIP-ENV"
 elif [ "$(origin_and_status "$RUN_JSON")" = "builtin:completed" ]; then

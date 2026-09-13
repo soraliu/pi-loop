@@ -156,7 +156,8 @@ const DEFAULT_LIST_LIMIT = 10;
 
 /**
  * 解析列表命令参数文本(`--limit N`;其余文本忽略——列表命令无任务位，与 /loop 的解析
- * 语义各自独立)。缺省 10;非正整数或缺值 → error(命令层提示参数错误)。
+ * 语义各自独立)。缺省 10;非正整数或缺值 → error 且 limit 置 0(哨兵值——error 路径的
+ * limit 不应被消费;若调用方误消费,0 只会得到空列表,不会以缺省值伪装成有效解析)。
  */
 export function parseLimitArgs(raw: string): ParsedLimitArgs {
   const tokens = raw.match(/"[^"]*"|\S+/g) ?? [];
@@ -165,14 +166,14 @@ export function parseLimitArgs(raw: string): ParsedLimitArgs {
     const value = tokens[i + 1]?.replace(/^"|"$/g, "");
     if (value === undefined) {
       return {
-        limit: DEFAULT_LIST_LIMIT,
+        limit: 0,
         error: "--limit 缺少值（如 --limit 5）",
       };
     }
     const limit = Number(value);
     if (!Number.isInteger(limit) || limit <= 0) {
       return {
-        limit: DEFAULT_LIST_LIMIT,
+        limit: 0,
         error: `非法 --limit 值：${value}（正整数）`,
       };
     }

@@ -54,15 +54,16 @@ iteration 记录、outputRef 与耗时遥测）。
   `loop_task` / `/loop` 以 `status=failed` 收尾，error 携带安装引导文案，
   不会挂死或裸崩（RPC 受理超时兜底）。
 - 其余失败（模型层熔断/额度/网络）同样收敛为 failed 结果，可从 run.json 审计。
-- 尚未接入：案例与方法论实档（M5）——`/loop-cases` 与 `/loop-methods` 仍是
-  统计 stub。（动态计划已由 M3 接入、评估与迭代闭环已由 M4 接入，见后续两节）
+- 案例与方法论实档自 M5 起就绪：`/loop-cases`（案例档案列表）与
+  `/loop-methods`（方法论库列表）为真实命令（详见下文 M5 节）。（动态计划已由
+  M3 接入、评估与迭代闭环已由 M4 接入，见后续两节）
 
 ### 冒烟验证（本地，不入 CI）
 
 | 脚本 | 覆盖 | 前置条件 | 量级 |
 | --- | --- | --- | --- |
 | `npm run smoke`（`scripts/smoke.sh`，M1） | 结构冒烟：扩展可加载、`loop_task` 可被调用、run id 落盘 | `pi` 命令 | 秒级 |
-| `bash scripts/smoke-e2e.sh`（M2 → M4 三场景） | 全链冒烟：场景 A designer 动态计划 + 逐步 spawn；场景 B `maxPlanSteps=1` 预算强制；场景 C `verifyCommand` 机器断言端到端（详见后续小节） | `pi` + `pi-subagents` + 可用模型与额度 + 用户级 researcher agent | 分钟级（三场景） |
+| `bash scripts/smoke-e2e.sh`（M2 → M5 三场景） | 全链冒烟：场景 A designer 动态计划 + 逐步 spawn + M5 档案链断言（run 终态后 `cases/` 新 Case、其 `runId` 归属本 run）；场景 B `maxPlanSteps=1` 预算强制；场景 C `verifyCommand` 机器断言端到端（详见后续小节） | `pi` + `pi-subagents` + 可用模型与额度 + 用户级 researcher agent | 分钟级（三场景） |
 
 两脚本降级语义一致：环境不满足（pi 缺失 / pi-subagents 缺席 / 模型熔断或额度耗尽）
 时 `SKIP` / `DEGRADED-PASS` 并 exit 0，只有断言真实失败才 exit 1。
@@ -158,6 +159,46 @@ evaluate → 注入 → 重跑 闭环落地。
 
 ```text
 /loop --effort low 实现工具函数并补单测 --verify "npm test"   # 退出码即验收结论
+```
+
+## M5 能力：记忆档案（Archivist）
+
+`/loop` 与 `loop_task` 自 M5 起拥有跨 run 的记忆：run 终态自动沉淀为案例档案，
+下一次 run 的计划设计会检索相似方法与案例注入参考。
+
+- **案例入档（run 终态自动 Case 化）**：每次 run 的三终点（`verified` /
+  `budget_exhausted` / 中止 `failed`）收尾后，终态 run.json 自动投影为案例档案
+  （`~/.pi/loop/cases/<id>.json`）。Case 是 run.json 的投影存档：`plan`/
+  `evaluation`/`final` 一律取 run.json 面（不自判结论）；`verified` =
+  `final.verdict === "verified"`、`finalScore` 如实；无 final 的 completed 视为
+  异常终止（verified=false 并留「异常终止」教训标记——诚实遥测）。执行链异常
+  （catch 收敛的非三终点形态）不入档；同 runId 幂等（重复触发不重复入档）；
+  入档失败只 warn 不阻塞主流程（结论已留档 run.json）。
+- **相似检索注入（Similar-case retrieval injection）**：每次 run 开始（计划设计
+  前）对方法库与案例档案做相似检索——中文 2-gram + ASCII 词元重叠评分（零依赖
+  自实现），方法另带 fitness 证据加权（uses/avgScore 平滑），案例带任务相似度 +
+  verified 加成；命中非空时注入 designer 提示词的「参考方法/案例」段（明示仅
+  作方法参考、防照抄旧计划），空库或零命中零成本省略（M3 designer 行为逐字节不
+  变）。In short: similar methods and past cases are retrieved by keyword-overlap
+  scoring and injected into the designer prompt as a clearly-labeled reference
+  section.
+- **`PI_LOOP_NO_ARCHIVE=1`（归档开关）**：跳过案例入档（不写 `cases/`）但**不关
+  检索注入**——归档是“写”、检索是“读”，两者独立控制：测试/隐私场景只关写、
+  不牺牲既存库的读红利。
+- **方法库 git 化**：`~/.pi/loop/methods/` 目录自身即一个 git 仓库（首个方法条目
+  写入时惰性 `git init`，local user 归因 pi-loop；同内容重放正当跳过）；每次条目
+  新增/修订/fitness 更新各一个 commit（主题 `methods: <id> ...`）；git 不在场时
+  warn 降级只写文件（不伪装已版本化）；**不自动 push**（无远端语义）。M5 v1 的
+  run 链尚不产生方法条目（Case.methodIds 恒空——方法关联与 fitness 更新自 M6
+  Meta-loop 真实消费起），`/loop-methods` 列表与检索通道已就绪。
+
+`/loop-cases` 与 `/loop-methods` 的真实功能（`--limit N` 截取，默认 10）：
+
+```text
+/loop-cases                # 案例档案：id / 验收徽标 / score / 日期 / 任务摘要（最新在前）
+/loop-cases --limit 5      # 同上，最多 5 条
+/loop-methods              # 方法论库：id / 名称 / uses / avgScore / 适用面要点
+/loop-methods --limit 5    # 同上，最多 5 条
 ```
 
 ## 开发

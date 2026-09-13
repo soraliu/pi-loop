@@ -1655,13 +1655,24 @@ describe("parseLimitArgs --limit 解析", () => {
     expect(parseLimitArgs("").limit).toBe(10);
     expect(parseLimitArgs("--limit 5")).toEqual({ limit: 5 });
     const bad = parseLimitArgs("--limit abc");
-    expect(bad.limit).toBe(10);
+    // error 路径 limit 置 0（哨兵值——不再携带缺省 10 假装有效解析）
+    expect(bad.limit).toBe(0);
     expect(bad.error).toContain("非法 --limit 值");
     const missing = parseLimitArgs("--limit");
     expect(missing.error).toContain("--limit 缺少值");
     // 负数与零拒绝（正整数要求）
     expect(parseLimitArgs("--limit 0").error).toBeDefined();
     expect(parseLimitArgs("--limit -3").error).toBeDefined();
+  });
+
+  it("error 路径 limit 恒 0（非法/缺值/零/负数四种形态全覆盖——哨兵值防止误消费）", () => {
+    // 消费方契约：error 在场时命令层直接提示不执行，limit 不会进入列表切片；
+    // 若调用方违规消费 limit，0 也只会得到空列表（不会以缺省 10 伪装成有效解析）
+    for (const raw of ["--limit abc", "--limit", "--limit 0", "--limit -3"]) {
+      const parsed = parseLimitArgs(raw);
+      expect(parsed.error).toBeDefined();
+      expect(parsed.limit).toBe(0);
+    }
   });
 });
 
