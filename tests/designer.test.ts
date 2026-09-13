@@ -22,6 +22,7 @@ import { generatePlan } from "../src/core/designer.ts";
 import { BUILTIN_PLAN } from "../src/core/planner-static.ts";
 import { DEFAULT_EFFORT_PRESETS } from "../src/storage/settings.ts";
 import { createRunRecord, ensureWorkspace } from "../src/storage/workspace.ts";
+import type { Case, MethodologyEntry } from "../src/types.ts";
 
 /** 本文件创建的临时目录清单——afterAll 只清理这些（登记制） */
 const createdDirs: string[] = [];
@@ -609,5 +610,155 @@ describe("generatePlan — 中止语义（abort 即降级，不再 spawn，不�
 		expect(outcome.plan.notes).toContain("中止");
 		// 中止后不再发起任何 designer 尝试
 		expect(fake.spawns).toHaveLength(1);
+	});
+});
+
+/* ============ M5-T2：检索注入面（retrieved 可选参数） ============ */
+
+/** 注入样本方法（适用面/fitness 概要是注入渲染的全部数据源） */
+const RETRIEVED_METHOD: MethodologyEntry = {
+	id: "m-review",
+	name: "评审改进法",
+	appliesTo: { taskTypes: ["代码评审"], signals: ["研究", "改进"] },
+	playbook: {
+		steps: [{ agent: "researcher", taskHint: "围绕 {task} 摸底现状" }],
+	},
+	fitness: { uses: 3, avgScore: 80 },
+	lineage: {},
+	updatedAt: "2026-09-13T00:00:00.000Z",
+};
+
+/** 注入样本案例（已验收、含未进注入的第三条教训——锁定「只摘 2 条」） */
+const RETRIEVED_CASE: Case = {
+	id: "c-review",
+	task: "研究并改进代码评审的流程",
+	methodIds: [],
+	origin: "designer",
+	plan: { steps: 3, notes: "三步走" },
+	runId: "r-sample",
+	finalScore: 92,
+	verified: true,
+	lessons: ["评审入口要先收敛判据", "对照基线再量化改进", "第三条不进注入"],
+	createdAt: "2026-09-13T00:00:00.000Z",
+};
+
+/** 注入样本案例（未验收、零教训——渲染分支：未验收/教训暂无） */
+const RETRIEVED_CASE_FAIL: Case = {
+	id: "c-review-fail",
+	task: "改进评审工具的选型研究",
+	methodIds: [],
+	origin: "builtin",
+	plan: { steps: 2 },
+	runId: "r-sample-fail",
+	finalScore: 40,
+	verified: false,
+	lessons: [],
+	createdAt: "2026-09-13T00:00:00.000Z",
+};
+
+describe("generatePlan — M5-T2 检索注入面", () => {
+	it("注入在场：prompt 含方法名/适用面/fitness 概要 + 案例摘要/结果/教训 + 参考语；段位次=用户任务后、预算约束前；schema/产物语义不变", async () => {
+		const { dataDir, runId, planFile } = setupRun();
+		const fake = new FakeRpc().script({
+			preComplete: () => fs.writeFileSync(planFile, JSON.stringify(goodPlan())),
+		});
+		const outcome = await generatePlan(
+			TASK,
+			PRESET,
+			{ rpc: fake, runId, dataDir },
+			{
+				methods: [RETRIEVED_METHOD],
+				cases: [RETRIEVED_CASE, RETRIEVED_CASE_FAIL],
+			},
+		);
+
+		// 注入只改任务文本：一次成功、file 通道、产物照常——schema/重试/降级语义未变
+		expect(outcome).toMatchObject({
+			attempts: 1,
+			degraded: false,
+			channel: "file",
+		});
+		const text = fake.spawns[0].task ?? "";
+		// 模板其余部分完好（注入不侵蚀既有段）
+		expect(text).toContain(TASK);
+		expect(text).toContain("【预算约束");
+		expect(text).toContain(planFile);
+		// 方法行：name + appliesTo 要点 + fitness 概要
+		expect(text).toContain("评审改进法");
+		expect(text).toContain("适用 代码评审");
+		expect(text).toContain("信号 研究、改进");
+		expect(text).toContain("已用 3 次、评估均分 80");
+		// 案例行：task 摘 + verified/score/计划步数 + 教训摘 2 条（第三条不进注入）
+		expect(text).toContain("研究并改进代码评审的流程");
+		expect(text).toContain("已验收，评分 92，计划 3 步");
+		expect(text).toContain("未验收，评分 40，计划 2 步");
+		expect(text).toContain("评审入口要先收敛判据");
+		expect(text).toContain("对照基线再量化改进");
+		expect(text).toContain("教训：暂无");
+		expect(text).not.toContain("第三条不进注入");
+		// 防过拟合提示语（仅作方法参考——非模板硬约束）
+		expect(text).toContain("仅作方法参考");
+		expect(text).toContain("按本任务特点");
+		expect(text).toContain("不要照搬旧计划");
+		// 段位次：【用户任务】<【参考方法/案例】<【预算约束】（结构须知之前——brief 指定）
+		expect(text.indexOf("【参考方法/案例")).toBeGreaterThan(
+			text.indexOf("【用户任务】"),
+		);
+		expect(text.indexOf("【预算约束")).toBeGreaterThan(
+			text.indexOf("【参考方法/案例"),
+		);
+	});
+
+	it("重试轮 fresh 模板完整自带参考段（重试语义不变：上轮错误附录照常携带）", async () => {
+		const { dataDir, runId, planFile } = setupRun();
+		const fake = new FakeRpc().script(
+			// 首轮坏计划（version=2）触发校验重试
+			{ preComplete: () => fs.writeFileSync(planFile, badVersionPlan()) },
+			{
+				preComplete: () => fs.writeFileSync(planFile, JSON.stringify(goodPlan())),
+			},
+		);
+		const outcome = await generatePlan(
+			TASK,
+			PRESET,
+			{ rpc: fake, runId, dataDir },
+			{ methods: [RETRIEVED_METHOD], cases: [RETRIEVED_CASE] },
+		);
+		expect(outcome).toMatchObject({
+			attempts: 2,
+			degraded: false,
+			channel: "file",
+		});
+		const retryText = fake.spawns[1].task ?? "";
+		expect(retryText).toContain("评审改进法");
+		expect(retryText).toContain("已验收，评分 92");
+		expect(retryText).toContain("上次的计划未通过校验");
+		expect(retryText).toContain("version 必须为数字 1");
+	});
+
+	it("缺省注入 = M3 行为逐字节不变：无第 4 参与空检索的 prompt 完全一致，且无参考段痕迹（回归锚）", async () => {
+		const { dataDir, runId, planFile } = setupRun();
+		// 与本文件首测「文件通道成功」的无注入 prompt 契约断言（未改动）互为印证：
+		// 缺省路径的任务文本除参考段外不容任何 byte 差异
+		const bare = new FakeRpc().script({
+			preComplete: () => fs.writeFileSync(planFile, JSON.stringify(goodPlan())),
+		});
+		await generatePlan(TASK, PRESET, { rpc: bare, runId, dataDir });
+		const emptyRetrieved = new FakeRpc().script({
+			preComplete: () => fs.writeFileSync(planFile, JSON.stringify(goodPlan())),
+		});
+		await generatePlan(
+			TASK,
+			PRESET,
+			{ rpc: emptyRetrieved, runId, dataDir },
+			{ methods: [], cases: [] },
+		);
+		// byte 级对照：空检索不新增任何字节（含空行）——缺省行为与 M3 完全一致
+		const bareText = bare.spawns[0].task ?? "";
+		expect(emptyRetrieved.spawns[0].task).toBe(bareText);
+		// 参考段零残留
+		expect(bareText).not.toContain("【参考方法/案例");
+		expect(bareText).not.toContain("仅作方法参考");
+		expect(bareText).not.toContain("不要照搬");
 	});
 });

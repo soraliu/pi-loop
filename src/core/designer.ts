@@ -4,7 +4,10 @@
 // 生成协议（动态研究计划的产出者）：
 //   ① 组装任务文本：任务原文 + 预算约束（maxPlanSteps 步数硬顶 / maxParallelSubagents
 //      并行上限）+ 计划结构须知 + 输出契约（两条都要：把 ResearchPlan JSON 写入
-//      <runDir>/designer-plan.json 文件 + 最终回复附 ```json 围栏完整副本）
+//      <runDir>/designer-plan.json 文件 + 最终回复附 ```json 围栏完整副本）。
+//      M5-T2 检索注入面：retrieved 在场时任务原文后追加「参考方法/案例」段
+//      （buildReferenceSection——防过拟合口径：明示仅作方法参考），缺省或空检索
+//      省略该段，其余模板逐字节不变（回归锚）
 //   ② spawn researcher（M3 无专用 designer agent 定义，researcher 兼任设计）：
 //      context:"fresh"（M2 熔断教训：fork+空输出不可靠）、不指定 model（继承会话默认）
 //   ③ 完成事件后双通道取产物：文件优先 → 回复围栏副本（末位启发）；
@@ -30,6 +33,7 @@ import {
 import { isNoReplyTimeout } from "./orchestrator.ts";
 import { validateResearchPlan } from "./plan-schema.ts";
 import { BUILTIN_PLAN } from "./planner-static.ts";
+import type { RetrievalResult } from "./retrieval.ts";
 import type { SubagentsRpcClient } from "./rpc.ts";
 import type { EffortPreset, ResearchPlan } from "../types.ts";
 
@@ -169,22 +173,90 @@ function lastJsonFence(text: string): string | undefined {
 	return last;
 }
 
+/** 案例任务在注入段的展示长度上限（超长截断——参考段保持紧凑，任务主谓通常在前段） */
+const CASE_TASK_SUMMARY_LIMIT = 80;
+
+/** 案例任务摘要：超长截断加省略号（前 80 字符） */
+function summariseCaseTask(task: string): string {
+	return task.length <= CASE_TASK_SUMMARY_LIMIT
+		? task
+		: `${task.slice(0, CASE_TASK_SUMMARY_LIMIT)}…`;
+}
+
+/**
+ * 「参考方法/案例」段（M5-T2 注入面）：过往沉淀的相似方法与案例渲染进提示词。
+ * 防过拟合口径：标题与正文双重明示「仅作方法参考，按本任务特点设计」——designer
+ * 不得把参考方法/旧案例当模板照抄（旧计划的步骤划分与措辞未必适配新任务）。
+ * 每方法一行（name + 适用面要点 + fitness 概要）；每案例三行（task 摘 +
+ * verified/评分/计划步数 + lessons 摘前 2 条）。
+ * retrieved 缺省或双列皆空 → 返回 undefined：模板整体不加该段（M3 行为逐字节不变
+ * ——回归锚；零命中时调用方本就应省略注入）。
+ */
+function buildReferenceSection(
+	retrieved?: RetrievalResult,
+): string | undefined {
+	const methods = retrieved?.methods ?? [];
+	const cases = retrieved?.cases ?? [];
+	if (methods.length === 0 && cases.length === 0) return undefined;
+	const lines: string[] = [
+		"【参考方法/案例（仅作方法参考，按本任务特点设计，非模板硬约束）】",
+		"以下为过往沉淀的相似方法与实战案例，仅供设计时参考——请按本任务的实际特点设计新计划，不要照搬旧计划的步骤结构与措辞。",
+	];
+	if (methods.length > 0) {
+		lines.push("相似方法：");
+		for (const method of methods) {
+			const traits: string[] = [];
+			if (method.appliesTo.taskTypes.length > 0) {
+				traits.push(`适用 ${method.appliesTo.taskTypes.join("、")}`);
+			}
+			if (method.appliesTo.signals.length > 0) {
+				traits.push(`信号 ${method.appliesTo.signals.join("、")}`);
+			}
+			traits.push(
+				`已用 ${method.fitness.uses} 次、评估均分 ${method.fitness.avgScore}`,
+			);
+			lines.push(`- ${method.name}（${traits.join("；")}）`);
+		}
+	}
+	if (cases.length > 0) {
+		lines.push("过往案例：");
+		for (const c of cases) {
+			const outcome = [
+				c.verified ? "已验收" : "未验收",
+				c.finalScore === undefined ? "无评分" : `评分 ${c.finalScore}`,
+				`计划 ${c.plan.steps} 步`,
+			].join("，");
+			const lessons = c.lessons.slice(0, 2).join("；");
+			lines.push(`- 任务：${summariseCaseTask(c.task)}`);
+			lines.push(`  结果：${outcome}`);
+			lines.push(`  教训：${lessons.length > 0 ? lessons : "暂无"}`);
+		}
+	}
+	return lines.join("\n");
+}
+
 /**
  * 设计师 spawn 的任务文本模板（每次尝试都完整自带——fresh 上下文无对话记忆）。
  * 内容：任务原文 + 预算约束（步数硬顶 / 并行上限）+ 计划结构须知（字段级 + 结构规则 +
  * 产出物建议）+ 输出契约（①写文件 ②回复围栏副本——两条都要）。
+ * M5-T2：retrieved 在场时在【用户任务】后插入「参考方法/案例」参考段
+ * （buildReferenceSection；缺省/空省略——模板与 M3 逐字节一致）。
  */
 function buildDesignerPrompt(
 	task: string,
 	preset: EffortPreset,
 	planFilePath: string,
+	retrieved?: RetrievalResult,
 ): string {
+	const reference = buildReferenceSection(retrieved);
 	return [
 		"你是研究计划设计师：为下述任务设计一份研究计划（ResearchPlan），后续编排器将按计划调度 subagent 并行执行。",
 		"",
 		"【用户任务】",
 		task,
 		"",
+		// 参考段条件插入（缺省/空检索 → 空元素——其余模板与 M3 逐字节一致）
+		...(reference === undefined ? [] : [reference, ""]),
 		"【预算约束（硬性，超出即被校验拒绝）】",
 		`- 计划步骤数上限：${preset.maxPlanSteps} 步`,
 		`- 并行度上限：最多 ${preset.maxParallelSubagents} 个 subagent 同时执行（无依赖关系的步骤会被并行调度）`,
@@ -294,18 +366,22 @@ function extractPlan(
  *   - 中止（signal）：立即降级且不再 spawn、不抛出（后续 executePlan 对已中止
  *     signal 自会 fail-fast——T4 收口 run 状态为 failed/aborted）。
  *
+ * @param retrieved 相似检索结果（M5-T2）：在场且非空时任务文本附「参考方法/案例」
+ * 参考段；缺省或双列空 → 不注入，M3 行为逐字节不变。不改变 schema/重试/降级任何语义
  * @returns DesignerOutcome（plan + attempts + degraded + channel——T4 落 RunRecord.plan）
  */
 export async function generatePlan(
 	task: string,
 	preset: EffortPreset,
 	ctx: GeneratePlanContext,
+	retrieved?: RetrievalResult,
 ): Promise<DesignerOutcome> {
 	// 产物目录防御：T4 流程中 createRunRecord 已建 runs/<id>；幂等兜底防接线顺序差异
 	const runDir = path.join(ctx.dataDir, "runs", ctx.runId);
 	fs.mkdirSync(runDir, { recursive: true });
 	const planFilePath = path.join(runDir, "designer-plan.json");
-	const basePrompt = buildDesignerPrompt(task, preset, planFilePath);
+	// 参考段随 basePrompt 进入每一轮尝试（fresh 模板完整自带——含重试轮）
+	const basePrompt = buildDesignerPrompt(task, preset, planFilePath, retrieved);
 
 	/** 局部：降级收尾（origin/channel 必为 builtin、notes 如实记原因——禁止冒充 designer 产物） */
 	const degrade = (attempts: number, reason: string): DesignerOutcome => ({

@@ -123,6 +123,11 @@ async function gitCommitAll(
 			await runGit(["config", "user.email", "pi-loop@local"], methodsDir);
 		}
 		await runGit(["add", "-A", "."], methodsDir);
+		// 同内容重复落盘（save 幂等重放 / fitness 回写同值）是正当无变更：git status
+		// 无待提交 → 跳过 commit（不落入 catch 分支的"commit 失败"告警——降噪；
+		// 当年 "nothing to commit" 退出码非零的语义本就不是失败）
+		const status = await runGit(["status", "--porcelain"], methodsDir);
+		if (status.trim().length === 0) return;
 		await runGit(["commit", "-m", message], methodsDir);
 	} catch (error) {
 		console.warn(

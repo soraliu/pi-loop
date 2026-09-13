@@ -141,6 +141,22 @@ describe("方法库 git 化", () => {
 			"methods: m-fit fitness update",
 		]);
 	});
+
+	it("同内容重复 save 不新增 git log 条目（commit 前查 status——无变更正当跳过，不告警）", async () => {
+		const dir = makeTempDir();
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			await saveMethodEntry(dir, makeEntry("m-dup"), "methods: m-dup add");
+			// 幂等重放：内容零 diff（即使提交意图改称 revise）也不产空 commit——
+			// 此前 git commit 因 "nothing to commit" 退出码非零落入 catch 告警（噪声）
+			await saveMethodEntry(dir, makeEntry("m-dup"), "methods: m-dup revise");
+			expect(commitSubjects(dir)).toEqual(["methods: m-dup add"]);
+			// 正当跳过非失败：不触发任何 git 相关告警
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
 });
 
 describe("updateFitness", () => {
