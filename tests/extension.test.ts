@@ -18,17 +18,25 @@ import type {
 } from "../src/extension/api.ts";
 import { registerLoopTools } from "../src/extension/tools.ts";
 import {
+  parseLimitArgs,
   parseLoopArgs,
   registerLoopCommands,
   listRecentRuns,
   makeStepNotifier,
 } from "../src/extension/commands.ts";
 import {
+  archiveRunCase,
   resolveDataDir,
   runLoopTask,
   runLoopTaskStub,
 } from "../src/extension/loop-task.ts";
-import type { LoopToolResult, RunTelemetry } from "../src/types.ts";
+import { saveCase } from "../src/storage/cases.ts";
+import type {
+  Case,
+  LoopToolResult,
+  MethodologyEntry,
+  RunTelemetry,
+} from "../src/types.ts";
 
 // ---------- executePlan 的 budget 注入捕获（M3-T5：M-1 收口）与返回形注入（M4-T0） ----------
 // vi.mock 对整个文件生效：wrapper 透传实际实现（既有用例零影响），只旁路记录
@@ -161,6 +169,54 @@ function makeNotifyCtx(): {
   };
 }
 
+// ---------- M5-T3 命令/检索/入档用例的最小夹具（cases.test.ts/methods.test.ts 同口径） ----------
+function makeCaseEntry(
+  id: string,
+  createdAt: string,
+  overrides: Partial<Case>,
+): Case {
+  return {
+    id,
+    task: "案例任务",
+    methodIds: [],
+    origin: "designer",
+    plan: { steps: 2 },
+    runId: `r-fixed-${id}`,
+    verified: false,
+    lessons: [],
+    createdAt,
+    ...overrides,
+  };
+}
+
+function makeMethodEntry(
+  id: string,
+  name: string,
+  taskTypes: string[],
+  signals: string[],
+  fitness: { uses: number; avgScore: number },
+): MethodologyEntry {
+  return {
+    id,
+    name,
+    appliesTo: { taskTypes, signals },
+    playbook: {
+      steps: [{ agent: "researcher", taskHint: "围绕 {task} 展开" }],
+    },
+    fitness,
+    lineage: {},
+    updatedAt: "2026-09-13T00:00:00.000Z",
+  };
+}
+
+/** cases/ 目录下的 *.json 数量（多 describe 复用；目录不存在 → 空数组） */
+function caseFilesOf(tmp: string): string[] {
+  const dir = path.join(tmp, "cases");
+  return fs.existsSync(dir)
+    ? fs.readdirSync(dir).filter((n) => n.endsWith(".json"))
+    : [];
+}
+
 // ---------- 环境双开关（PI_LOOP_DATA_DIR 定盘 / PI_LOOP_STUB 切行为） ----------
 function snapshotEnv(...names: string[]): Record<string, string | undefined> {
   const saved: Record<string, string | undefined> = {};
@@ -184,10 +240,18 @@ function setLoopEnv(
   dir: string,
   mode: "stub" | "real",
 ): Record<string, string | undefined> {
-  const saved = snapshotEnv("PI_LOOP_DATA_DIR", "PI_LOOP_STUB");
+  const saved = snapshotEnv(
+    "PI_LOOP_DATA_DIR",
+    "PI_LOOP_STUB",
+    "PI_LOOP_NO_ARCHIVE",
+  );
   process.env.PI_LOOP_DATA_DIR = dir;
   if (mode === "stub") process.env.PI_LOOP_STUB = "1";
-  else delete process.env.PI_LOOP_STUB;
+  else {
+    delete process.env.PI_LOOP_STUB;
+    // real 模式清除归档开关——防外环境泄漏 PI_LOOP_NO_ARCHIVE=1 使归档用例默认跳过入档
+    delete process.env.PI_LOOP_NO_ARCHIVE;
+  }
   return saved;
 }
 
@@ -599,22 +663,144 @@ describe("/loop-status、/loop-cases、/loop-methods", () => {
     }
   });
 
-  it("loop-cases / loop-methods 显示目录统计", async () => {
+  it("loop-cases：已入档案例行渲染（缩短 id/验收徽标/score/日期/任务截断 40）+ 最新在前 + --limit N", async () => {
     const tmp = makeTempDir();
     const prev = process.env.PI_LOOP_DATA_DIR;
     process.env.PI_LOOP_DATA_DIR = tmp;
     try {
-      // 预置工作区（countFiles 只统计文件，不统计目录）
-      fs.mkdirSync(path.join(tmp, "cases"), { recursive: true });
-      fs.writeFileSync(path.join(tmp, "cases", "case-1.json"), "{}\n");
-      fs.mkdirSync(path.join(tmp, "methods"), { recursive: true });
+      const longTask = "长任务".repeat(20); // 60 字 → 截断为前 40 + …
+      await saveCase(
+        tmp,
+        makeCaseEntry("c-demo0001-aaaaaa", "2026-09-13T08:00:00.000Z", {
+          verified: true,
+          finalScore: 92,
+          task: "研究 rust tokio 调度器内幕",
+        }),
+      );
+      await saveCase(
+        tmp,
+        makeCaseEntry("c-demo0002-bbbbbb", "2026-09-12T08:00:00.000Z", {
+          verified: false,
+          task: longTask,
+        }),
+      );
       const { pi, commands } = makeFakePi();
       registerLoopCommands(pi);
       const { ctx, messages } = makeNotifyCtx();
       await commands.get("loop-cases")!.handler("", ctx);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].level).toBe("info");
+      const text = messages[0].text;
+      // 头行 + 最新在前（demo0001 先于 demo0002）
+      expect(text).toContain("最近 2 条案例:");
+      expect(text.indexOf("c-demo0001-a…")).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf("c-demo0001-aaaaaa")).toBe(-1);
+      expect(text.indexOf("c-demo0001-a…")).toBeLessThan(
+        text.indexOf("c-demo0002"),
+      );
+      // 徽标 / 评分 / 日期 / 任务截断 40 字
+      expect(text).toContain("[已验收]");
+      expect(text).toContain("score=92");
+      expect(text).toContain("2026-09-13");
+      expect(text).toContain("[未验收]");
+      expect(text).toContain("score=?");
+      expect(text).toContain("2026-09-12");
+      // 超长任务截断：仅在尾一见省略号、不出现全文
+      expect(text).toContain("长任务".repeat(20).slice(0, 40) + "…");
+      // --limit 1 → 只保留最新一条
+      const { ctx: ctxLim, messages: msgsLim } = makeNotifyCtx();
+      await commands.get("loop-cases")!.handler("--limit 1", ctxLim);
+      expect(msgsLim[0].text).toContain("最近 1 条案例:");
+      expect(msgsLim[0].text).toContain("c-demo0001-a…");
+      expect(msgsLim[0].text).not.toContain("c-demo0002");
+    } finally {
+      if (prev === undefined) delete process.env.PI_LOOP_DATA_DIR;
+      else process.env.PI_LOOP_DATA_DIR = prev;
+    }
+  });
+
+  it("loop-cases：--limit 非法/缺值 → 参数错误 notify；空库 → 尚无案例档案", async () => {
+    const tmp = makeTempDir();
+    const prev = process.env.PI_LOOP_DATA_DIR;
+    process.env.PI_LOOP_DATA_DIR = tmp;
+    try {
+      const { pi, commands } = makeFakePi();
+      registerLoopCommands(pi);
+      const { ctx: ctxBad, messages: msgsBad } = makeNotifyCtx();
+      await commands.get("loop-cases")!.handler("--limit abc", ctxBad);
+      expect(msgsBad[0].level).toBe("error");
+      expect(msgsBad[0].text).toContain("参数错误");
+      expect(msgsBad[0].text).toContain("非法 --limit 值");
+      const { ctx: ctxMiss, messages: msgsMiss } = makeNotifyCtx();
+      await commands.get("loop-cases")!.handler("--limit", ctxMiss);
+      expect(msgsMiss[0].text).toContain("--limit 缺少值");
+      const { ctx: ctxEmpty, messages: msgsEmpty } = makeNotifyCtx();
+      await commands.get("loop-cases")!.handler("", ctxEmpty);
+      expect(msgsEmpty[0].level).toBe("info");
+      expect(msgsEmpty[0].text).toContain("尚无案例档案");
+      expect(msgsEmpty[0].text).toContain(path.join(tmp, "cases"));
+    } finally {
+      if (prev === undefined) delete process.env.PI_LOOP_DATA_DIR;
+      else process.env.PI_LOOP_DATA_DIR = prev;
+    }
+  });
+
+  it("loop-methods：条目行（id/name/uses/avgScore/适用要点）+ --limit N + 空库", async () => {
+    const tmp = makeTempDir();
+    const prev = process.env.PI_LOOP_DATA_DIR;
+    process.env.PI_LOOP_DATA_DIR = tmp;
+    try {
+      fs.mkdirSync(path.join(tmp, "methods"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmp, "methods", "m-alpha.json"),
+        JSON.stringify(
+          makeMethodEntry(
+            "m-alpha",
+            "反射调研法",
+            ["research", "对比"],
+            ["调研"],
+            { uses: 3, avgScore: 80 },
+          ),
+        ),
+      );
+      fs.writeFileSync(
+        path.join(tmp, "methods", "m-beta.json"),
+        JSON.stringify(
+          makeMethodEntry("m-beta", "后设方法", [], [], {
+            uses: 0,
+            avgScore: 0,
+          }),
+        ),
+      );
+      const { pi, commands } = makeFakePi();
+      registerLoopCommands(pi);
+      const { ctx, messages } = makeNotifyCtx();
       await commands.get("loop-methods")!.handler("", ctx);
-      expect(messages[0].text).toContain("1 个文件");
-      expect(messages[1].text).toContain("0 个文件");
+      expect(messages[0].level).toBe("info");
+      const text = messages[0].text;
+      expect(text).toContain("方法库 2 条:");
+      // 字典序：m-alpha 先于 m-beta（id 缩短后单字在“最近/最新在前”口径外不适用，减为“id 在文件名字典序”）
+      expect(text.indexOf("m-alpha")).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf("m-alpha")).toBeLessThan(text.indexOf("m-beta"));
+      expect(text).toContain("反射调研法");
+      expect(text).toContain("uses=3");
+      expect(text).toContain("avgScore=80");
+      expect(text).toContain("适用 research、对比；信号 调研");
+      // m-beta 无适用面声明 → “适用面未声明”
+      expect(text).toContain("适用面未声明");
+      // --limit 1 → 只留首条 m-alpha
+      const { ctx: ctxLim, messages: msgsLim } = makeNotifyCtx();
+      await commands.get("loop-methods")!.handler("--limit 1", ctxLim);
+      expect(msgsLim[0].text).toContain("方法库 1 条:");
+      expect(msgsLim[0].text).toContain("m-alpha");
+      expect(msgsLim[0].text).not.toContain("m-beta");
+      // 空库（另起不过纤手入新条目的目录）
+      const emptyDir = makeTempDir();
+      process.env.PI_LOOP_DATA_DIR = emptyDir;
+      const { ctx: ctxEmpty, messages: msgsEmpty } = makeNotifyCtx();
+      await commands.get("loop-methods")!.handler("", ctxEmpty);
+      expect(msgsEmpty[0].text).toContain("尚无方法条目");
+      expect(msgsEmpty[0].text).toContain(path.join(emptyDir, "methods"));
     } finally {
       if (prev === undefined) delete process.env.PI_LOOP_DATA_DIR;
       else process.env.PI_LOOP_DATA_DIR = prev;
@@ -1457,6 +1643,328 @@ describe("runLoopTask — 陈旧终态窗收口（M5-T1，M4 终审 M-1）", () 
       expect(record.error).toContain("I/O 基建故障");
       // 收口只落 failed + error——不伪造 final/evaluation（闭环从未收尾）
       expect(record.final).toBeUndefined();
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+});
+
+// ---------- M5-T3：归档接线（三终点） + 检索连线贯通 ----------
+describe("parseLimitArgs --limit 解析", () => {
+  it("缺省 10;正整数生效;非法/缺值 → error", () => {
+    expect(parseLimitArgs("").limit).toBe(10);
+    expect(parseLimitArgs("--limit 5")).toEqual({ limit: 5 });
+    const bad = parseLimitArgs("--limit abc");
+    expect(bad.limit).toBe(10);
+    expect(bad.error).toContain("非法 --limit 值");
+    const missing = parseLimitArgs("--limit");
+    expect(missing.error).toContain("--limit 缺少值");
+    // 负数与零拒绝（正整数要求）
+    expect(parseLimitArgs("--limit 0").error).toBeDefined();
+    expect(parseLimitArgs("--limit -3").error).toBeDefined();
+  });
+});
+
+describe("runLoopTask — 归档接线（M5-T3 三终点）", () => {
+  function readArchived(tmp: string): Case {
+    const files = caseFilesOf(tmp);
+    expect(files).toHaveLength(1);
+    return JSON.parse(
+      fs.readFileSync(path.join(tmp, "cases", files[0]), "utf-8"),
+    ) as Case;
+  }
+
+  it("verified 终点：完成后终态 run.json 投影入档 cases/（verified/finalScore/task/plan 如实、lessons 含评估 reasons）", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      const result = await runLoopTask(
+        { task: "研究 tokio 调度器内幕" },
+        { busEnv: makeFakeSubagentsBus() },
+      );
+      expect(result.status).toBe("completed");
+      const c = readArchived(tmp);
+      expect(c.runId).toBe(result.runId);
+      expect(c.task).toBe("研究 tokio 调度器内幕");
+      expect(c.verified).toBe(true);
+      expect(c.finalScore).toBe(92);
+      expect(c.methodIds).toEqual([]);
+      // 通用 fake 无产物 → designer 降级 builtin（诚实入档 origin）
+      expect(c.origin).toBe("builtin");
+      expect(c.plan.steps).toBe(1);
+      expect(c.lessons).toContain("覆盖全部验收标准");
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("budget_exhausted 终点：预算尽同样入档（verified=false、finalScore 如实、origin 如实）", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      const result = await runLoopTask(
+        { task: "预算尽入档任务" },
+        { busEnv: makeFakeSubagentsBus({ mode: "silent" }), rpcTimeoutMs: 25 },
+      );
+      expect(result.status).toBe("budget_exhausted");
+      const c = readArchived(tmp);
+      expect(c.runId).toBe(result.runId);
+      expect(c.task).toBe("预算尽入档任务");
+      expect(c.verified).toBe(false);
+      expect(c.finalScore).toBe(0);
+      expect(c.origin).toBe("builtin");
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("failed 终点（预中止）：如实入档（verified=false、plan 已记 builtin、lessons 含中止标记）", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      const controller = new AbortController();
+      controller.abort();
+      const result = await runLoopTask(
+        { task: "预中止入档任务" },
+        { busEnv: makeFakeSubagentsBus(), signal: controller.signal },
+      );
+      expect(result.status).toBe("failed");
+      const c = readArchived(tmp);
+      expect(c.runId).toBe(result.runId);
+      expect(c.verified).toBe(false);
+      expect(c.finalScore).toBe(0);
+      expect(c.origin).toBe("builtin");
+      expect(c.lessons.some((l) => l.includes("中止"))).toBe(true);
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("执行链异常（catch 收敛）不入档：非三终点形态，不产案例（不噪声）", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      designerFailures.push(new Error("入档前置异常"));
+      const result = await runLoopTask(
+        { task: "异常不入档任务" },
+        { busEnv: makeFakeSubagentsBus() },
+      );
+      expect(result.status).toBe("failed");
+      expect(caseFilesOf(tmp)).toHaveLength(0);
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  it("PI_LOOP_NO_ARCHIVE=1：case 不入档；检索注入照常（归档与注入经开关独立解耦）", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    process.env.PI_LOOP_NO_ARCHIVE = "1";
+    try {
+      // 预置方法条目以验证“检索照常”（开关只关写入不关读取）
+      fs.mkdirSync(path.join(tmp, "methods"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmp, "methods", "m-noarch.json"),
+        JSON.stringify(
+          makeMethodEntry("m-noarch", "方法 m-noarch", [], ["tokio"], {
+            uses: 2,
+            avgScore: 70,
+          }),
+        ),
+      );
+      const bus = makeFakeSubagentsBus();
+      const result = await runLoopTask(
+        { task: "研究 rust tokio 调度器内幕" },
+        { busEnv: bus },
+      );
+      expect(result.status).toBe("completed");
+      // case 不入档（开关生效）
+      expect(caseFilesOf(tmp)).toHaveLength(0);
+      // 检索注入照常——designer 任务文本仍含参考段
+      const designerTask = bus.spawnedTasks.find((t) =>
+        t.includes("研究计划设计师"),
+      );
+      expect(designerTask).toBeDefined();
+      expect(designerTask!).toContain("【参考方法/案例");
+      expect(designerTask!).toContain("方法 m-noarch");
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+});
+
+describe("archiveRunCase — 入档直连（M5-T3 幂等与防御）", () => {
+  function writeRunRecord(
+    tmp: string,
+    runId: string,
+    record: Record<string, unknown>,
+  ): void {
+    fs.mkdirSync(path.join(tmp, "runs", runId), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, "runs", runId, "run.json"),
+      JSON.stringify(record, null, "\t") + "\n",
+    );
+  }
+  function verifiedRecord(
+    runId: string,
+    task: string,
+  ): Record<string, unknown> {
+    return {
+      id: runId,
+      task,
+      taskPreview: task,
+      effort: "medium",
+      status: "completed",
+      createdAt: "2026-09-13T00:00:00.000Z",
+      iterations: [],
+      plan: {
+        origin: "designer",
+        steps: 2,
+        notes: "两步",
+        degraded: false,
+        channel: "file",
+        attempts: 1,
+      },
+      round: 0,
+      evaluation: {
+        verdict: "verified",
+        score: 90,
+        reasons: ["覆盖全部验收标准"],
+        blame: [],
+      },
+      final: { round: 0, verdict: "verified", score: 90 },
+    };
+  }
+
+  it("终态记录入档 + 同 runId 重复调用幂等跳过（档案不重复、内容不漂移）", async () => {
+    const tmp = makeTempDir();
+    writeRunRecord(
+      tmp,
+      "r-arch-01",
+      verifiedRecord("r-arch-01", "入档直连任务"),
+    );
+    await archiveRunCase(tmp, "r-arch-01", "入档直连任务");
+    const files = fs
+      .readdirSync(path.join(tmp, "cases"))
+      .filter((n) => n.endsWith(".json"));
+    expect(files).toHaveLength(1);
+    const caseFile = path.join(tmp, "cases", files[0]);
+    const c = JSON.parse(fs.readFileSync(caseFile, "utf-8")) as Case;
+    expect(c.runId).toBe("r-arch-01");
+    expect(c.task).toBe("入档直连任务");
+    expect(c.verified).toBe(true);
+    expect(c.finalScore).toBe(90);
+    expect(c.origin).toBe("designer");
+    const before = fs.readFileSync(caseFile, "utf-8");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await archiveRunCase(tmp, "r-arch-01", "入档直连任务");
+      expect(
+        fs
+          .readdirSync(path.join(tmp, "cases"))
+          .filter((n) => n.endsWith(".json")),
+      ).toHaveLength(1);
+      // 内容不漂移（byte 级一致：同一 runId 重推不重写文件）
+      expect(fs.readFileSync(caseFile, "utf-8")).toBe(before);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("跳过重复入档");
+      expect(String(warn.mock.calls[0]?.[0])).toContain("r-arch-01");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("plan 缺席（异常终态形态）→ warn 跳过不抽抛出（T1 挂账的 catch 点兑底）", async () => {
+    const tmp = makeTempDir();
+    const record = verifiedRecord("r-noplan", "任务");
+    delete record.plan;
+    writeRunRecord(tmp, "r-noplan", record);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // 不抽抛出：入档失败不阻塞主流程的直接证明
+      await archiveRunCase(tmp, "r-noplan", "任务");
+      expect(warn).toHaveBeenCalledTimes(1);
+      // T1 挂账：caseFromRunRecord 的“缺 plan”抛错被 catch 收口，warn 连带原因
+      expect(String(warn.mock.calls[0]?.[0])).toContain("缺 plan");
+      expect(caseFilesOf(tmp)).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("runLoopTask — 检索连线贯通（M5-T3）", () => {
+  it("seed 方法条目 + 上一 run 入档的案例 → 下一次 run 的 designer 任务文本含参考段（入档/检索贯通：下一 run 时档案可见）", async () => {
+    const tmp = makeTempDir();
+    const saved = setLoopEnv(tmp, "real");
+    try {
+      // 方法库预置（直写：listMethods 只读 JSON，不经 saveMethodEntry 免 git noise）
+      fs.mkdirSync(path.join(tmp, "methods"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmp, "methods", "m-ref.json"),
+        JSON.stringify(
+          makeMethodEntry("m-ref", "方法 m-ref", ["调度器"], ["tokio"], {
+            uses: 0,
+            avgScore: 0,
+          }),
+        ),
+      );
+      const designerPlan = {
+        version: 1,
+        task: "研究 rust tokio 调度器内幕",
+        origin: "designer",
+        notes: "两步",
+        steps: [
+          {
+            id: "survey",
+            agent: "researcher",
+            task: "摸底主流方案",
+            dependsOn: [],
+          },
+          {
+            id: "synth",
+            agent: "researcher",
+            task: "综合对比结论",
+            dependsOn: [],
+          },
+        ],
+      };
+      const preComplete = (task: string) => {
+        const m = /把最终 ResearchPlan 的完整 JSON 写入文件：(\S+)/.exec(task);
+        if (!m) return;
+        fs.mkdirSync(path.dirname(m[1]), { recursive: true });
+        fs.writeFileSync(m[1], JSON.stringify(designerPlan));
+      };
+      const bus1 = makeFakeSubagentsBus({ preComplete });
+      const first = await runLoopTask(
+        { task: "研究 rust tokio 调度器内幕" },
+        { busEnv: bus1 },
+      );
+      expect(first.status).toBe("completed");
+      // run 1：方法列在场（预置），案例列不在场（档案尚空）
+      const dp1 = bus1.spawnedTasks.find((t) => t.includes("研究计划设计师"));
+      expect(dp1).toBeDefined();
+      expect(dp1!).toContain("【参考方法/案例");
+      expect(dp1!).toContain("方法 m-ref");
+      expect(dp1!).not.toContain("过往案例");
+      // run 1 入档了一条案例
+      expect(fs.readdirSync(path.join(tmp, "cases")).length).toBe(1);
+      const bus2 = makeFakeSubagentsBus({ preComplete });
+      const second = await runLoopTask(
+        { task: "研究 rust tokio 调度器的并发模型" },
+        { busEnv: bus2 },
+      );
+      expect(second.status).toBe("completed");
+      // run 2：方法列照常，案例列贯通——上一 run 的案例此刻在场
+      const dp2 = bus2.spawnedTasks.find((t) => t.includes("研究计划设计师"));
+      expect(dp2).toBeDefined();
+      expect(dp2!).toContain("【参考方法/案例");
+      expect(dp2!).toContain("方法 m-ref");
+      expect(dp2!).toContain("过往案例");
+      // 案例任务原文（≤80 不截断）
+      expect(dp2!).toContain("研究 rust tokio 调度器内幕");
+      // 两个 run 不同 runId → 各入档一条案例
+      expect(fs.readdirSync(path.join(tmp, "cases")).length).toBe(2);
     } finally {
       restoreEnv(saved);
     }

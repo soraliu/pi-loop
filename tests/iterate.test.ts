@@ -737,4 +737,74 @@ describe("runWithIterations — 迭代闭环（SPEC §4）", () => {
 		// omit 的真义：键不在场，而非全零对象
 		expect(rejectedRecord).not.toHaveProperty("telemetry");
 	});
+
+	it("ctx.retrieved 检索透传（M5-T3）：首轮与重设计的 designer 任务文本均含参考段（generatePlan 第 4 参贯通）", async () => {
+		const ctx = setupRun();
+		ctx.fake.designerPlans = [twoStepPlan(), redesignPlan()];
+		const REASON = "全盘方向需要重新设计";
+		ctx.fake.criticReplies = [
+			fenceEvaluation({
+				verdict: "fail",
+				score: 5,
+				reasons: [REASON],
+				blame: ["survey", "synth"],
+			}),
+			fenceEvaluation({
+				verdict: "fail",
+				score: 5,
+				reasons: [REASON],
+				blame: ["survey", "synth"],
+			}),
+			fenceEvaluation({
+				verdict: "verified",
+				score: 90,
+				reasons: ["重构后达标"],
+				blame: [],
+			}),
+		];
+		const result = await runWithIterations(PLAN_TASK, presetOf(2), {
+			rpc: ctx.fake,
+			runId: ctx.runId,
+			dataDir: ctx.dataDir,
+			retrieved: {
+				methods: [
+					{
+						id: "m-iter",
+						name: "方法 m-iter",
+						appliesTo: { taskTypes: ["研究"], signals: ["调度"] },
+						playbook: {
+							steps: [{ agent: "researcher", taskHint: "围绕 {task}" }],
+						},
+						fitness: { uses: 2, avgScore: 80 },
+						lineage: {},
+						updatedAt: "2026-09-13T00:00:00.000Z",
+					},
+				],
+				cases: [
+					{
+						id: "c-iter",
+						task: "研究并发调度策略的历史案例",
+						methodIds: [],
+						origin: "designer",
+						plan: { steps: 2 },
+						runId: "r-iter",
+						finalScore: 85,
+						verified: true,
+						lessons: ["教训一", "教训二"],
+						createdAt: "2026-09-13T00:00:00.000Z",
+					},
+				],
+			},
+		});
+
+		expect(result.outcome).toBe("verified");
+		// 首轮 + 重设计各一次 generatePlan：两份 designer 任务文本都应含参考段
+		expect(ctx.fake.designerPrompts).toHaveLength(2);
+		for (const prompt of ctx.fake.designerPrompts) {
+			expect(prompt).toContain("【参考方法/案例");
+			expect(prompt).toContain("方法 m-iter");
+			expect(prompt).toContain("过往案例");
+			expect(prompt).toContain("研究并发调度策略的历史案例");
+		}
+	});
 });

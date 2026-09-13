@@ -195,12 +195,44 @@ export async function listMethods(
 }
 
 /**
+ * updateFitness 的防御读取（T1-review M2 挂账、M5-T3 收口）：损坏 JSON / 缺形
+ * fitness 不再裸抛——与 listMethods 的 warn-skip 口径统一（方法层一处防御收口）；
+ * 跳过而非写回：把损坏内容洗白成合法半形条目比不动它更伤档案。条目缺席仍由
+ * updateFitness 自身抛错——那是调用方 bug（id 传错），不是档案损坏。
+ * @returns 顶层与 fitness 形状校验过的条目；损坏时 undefined（warn 已投）。
+ */
+function readEntryTolerant(file: string): MethodologyEntry | undefined {
+	try {
+		const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("顶层不是对象");
+		}
+		const entry = parsed as MethodologyEntry;
+		if (
+			typeof entry.fitness?.uses !== "number" ||
+			typeof entry.fitness?.avgScore !== "number"
+		) {
+			throw new Error("fitness 形状缺失（uses/avgScore 非数字）");
+		}
+		return entry;
+	} catch (error) {
+		console.warn(
+			`[pi-loop] 方法条目读取失败（跳过 fitness 更新）：${file}：${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+		return undefined;
+	}
+}
+
+/**
  * 方法 fitness 更新：读改写（磁盘为事实源——口径同 run.json 的收口路径），
  * 随后 git commit（"methods: <id> fitness update"）。
  * 数学（平滑累计均值——严格等价于全体历史 score 的算术平均，不舍入保持精度）：
  *   uses' = uses + 1；avgScore' = (avgScore×uses + score) / (uses + 1)
  * 只记真实 run 结果：score 应为该次 run 的 final.score（evaluator 已 clamp 0-100）。
- * @throws 条目文件不存在时（存储层如实报错，不静默吞——调用方负责降级收口）
+ * @throws 条目文件不存在时（存储层如实报错，不静默吞——调用方负责降级收口；
+ *   损坏 JSON / 缺 fitness 形状走 warn-skip 而非抛错——详见 readEntryTolerant）
  */
 export async function updateFitness(
 	dataDir: string,
@@ -211,7 +243,9 @@ export async function updateFitness(
 	if (!fs.existsSync(file)) {
 		throw new Error(`方法条目不存在，无法更新 fitness：${file}`);
 	}
-	const entry = JSON.parse(fs.readFileSync(file, "utf-8")) as MethodologyEntry;
+	// 损坏 JSON 裸抛 → warn-skip：不抛出不洗白文件（与 listMethods 一处防御收口）
+	const entry = readEntryTolerant(file);
+	if (entry === undefined) return;
 	const uses = entry.fitness.uses;
 	entry.fitness.avgScore = (entry.fitness.avgScore * uses + score) / (uses + 1);
 	entry.fitness.uses = uses + 1;

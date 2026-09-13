@@ -206,3 +206,41 @@ describe("git 缺席降级", () => {
 		}
 	});
 });
+
+describe("updateFitness 损坏 JSON 兜底（M5-T3，T1-review M2）", () => {
+	it("坏 JSON / 缺 fitness 形状 → warn 跳过不抛出（文件原样、好条目后续更新不受影响、无新 commit）", async () => {
+		const dir = makeTempDir();
+		await saveMethodEntry(dir, makeEntry("m-good"), "methods: m-good add");
+		fs.writeFileSync(path.join(dir, "methods", "m-broken.json"), "{ 这不是 JSON");
+		fs.writeFileSync(
+			path.join(dir, "methods", "m-shape.json"),
+			JSON.stringify({ id: "m-shape", name: "x" }),
+		);
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			await updateFitness(dir, "m-broken", 50);
+			await updateFitness(dir, "m-shape", 50);
+			expect(warn).toHaveBeenCalledTimes(2);
+			expect(String(warn.mock.calls[0]?.[0])).toContain("m-broken.json");
+			expect(String(warn.mock.calls[1]?.[0])).toContain("m-shape");
+			// 坏档不被洗白（原样保留、未生成文件未留代理文、git 不产新 commit）
+			expect(
+				fs.readFileSync(path.join(dir, "methods", "m-broken.json"), "utf-8"),
+			).toBe("{ 这不是 JSON");
+			expect(commitSubjects(dir)).toEqual(["methods: m-good add"]);
+			// 好条目照常更新（防御不阻塞后续链路）
+			await updateFitness(dir, "m-good", 90);
+			expect(commitSubjects(dir)).toEqual([
+				"methods: m-good add",
+				"methods: m-good fitness update",
+			]);
+			const listed = await listMethods(dir);
+			expect(listed.find((m) => m.id === "m-good")?.fitness).toEqual({
+				uses: 1,
+				avgScore: 90,
+			});
+		} finally {
+			warn.mockRestore();
+		}
+	});
+});

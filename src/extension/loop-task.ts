@@ -1,6 +1,9 @@
 // loop_task 的执行核心（M1-T4 stub → M2-T4 真实调度内核接入 → M3-T4 designer 接线
 // → M4-T0 债务收口 → M4-T2 迭代闭环接线）
 // 工具（loop_task）与命令（/loop）共享同一入口——单一事实源，保证两边行为一致。
+// M5-T3：检索连线（prepareRun 后由 retrieveForRun 检回相似方法/案例，透传给 designer）
+// + 三终点入档（runWithIterations 正常返回后 archiveRunCase 落案例档案；PI_LOOP_NO_ARCHIVE
+// 关入档不关检索——读写两开关独立）。
 // 双行为分派：PI_LOOP_STUB=1 保留 M1 stub 语义（冒烟/降级/回归）；缺省走真实调度——
 // 三步链（配置快照 → 建工作区 → 落 run.json）之后构造 SubagentsRpcClient，交
 // runWithIterations 迭代闭环（designer 降级 builtin 照常进循环；execute → evaluate
@@ -21,7 +24,10 @@ import {
 } from "../core/iterate.ts";
 import type { PlanUpdate } from "../core/orchestrator.ts";
 import type { DesignerOutcome } from "../core/designer.ts";
+import { retrieve, type RetrievalResult } from "../core/retrieval.ts";
 import { SubagentsRpcClient, type SubagentEventBus } from "../core/rpc.ts";
+import { caseFromRunRecord, listCases, saveCase } from "../storage/cases.ts";
+import { listMethods } from "../storage/methods.ts";
 import {
   DEFAULT_EFFORT_LEVEL,
   isEffortLevel,
@@ -57,6 +63,74 @@ export function validateLoopParams(params: LoopToolParams): void {
 /** PI_LOOP_STUB=1 → true（stub 双行为开关：冒烟/降级用，M1 用例的回归口径） */
 function isStubMode(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.PI_LOOP_STUB?.trim() === "1";
+}
+
+/** PI_LOOP_NO_ARCHIVE=1 → true（归档开关：case 不入档；检索注入照常——入档是写、
+ * 检索是读，两件事独立控制：测试/隐私场景只关“写”而不牺牲既存库的“读”红利） */
+function isArchiveDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PI_LOOP_NO_ARCHIVE?.trim() === "1";
+}
+
+/**
+ * 相似检索连线（M5-T3）：run 前（prepareRun 后）从方法库与案例档案检相似条目——
+ * designer 参考段的注入素材。“下一次 run 时”的时序即此：上一 run 的入档发生在它的
+ * 收尾，本轮的检索发生在头部（与本轮自己的入档无自引用）。空库/零命中 → 双空数组
+ * （generatePlan 自然省略参考段——零成本路径）；库读取异带（listMethods/listCases
+ * 已各自容错坏文件，此处只兜目录级 IO 故障）→ warn 降级为无检索（方法库/档案是
+ * 增益不是前置，检索失败不阻塞任务主流程）。
+ */
+export async function retrieveForRun(
+  dataDir: string,
+  task: string,
+): Promise<RetrievalResult | undefined> {
+  try {
+    const [methods, cases] = await Promise.all([
+      listMethods(dataDir),
+      listCases(dataDir),
+    ]);
+    return retrieve(task, { methods, cases });
+  } catch (error) {
+    console.warn(
+      `[pi-loop] 相似检索失败（跳过参考注入）：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return undefined;
+  }
+}
+
+/**
+ * 案例档案入档（M5-T3 三终点收口接线；导出仅供测试直连——runLoopTask 每 run 恰
+ * 调用一次）：终态 run.json → caseFromRunRecord 投影 → saveCase 落档。幂等防护：
+ * saveCase 前扫档案查同 runId（Case.id 与 runId 不同——查重键取 runId）已有即跳过
+ * （全量扫描的量级成本在 M5 归零——档案单目录 JSON 顺序读，量大时的索引属 M7）；
+ * 防御收口（T1 挂账的 T3 catch 点）：caseFromRunRecord 的抛错（如 plan 缺失的异常
+ * 终态形态）与一切 IO 异常在此 warn + 吞——入档失败不阻塞主流程（任务结论已留档
+ * run.json，档案是可为空的增益层）。
+ */
+export async function archiveRunCase(
+  dataDir: string,
+  runId: string,
+  task: string,
+): Promise<void> {
+  try {
+    const existing = await listCases(dataDir);
+    if (existing.some((c) => (c.runId ?? undefined) === runId)) {
+      console.warn(
+        `[pi-loop] run 已有案例档案（runId=${runId}），跳过重复入档`,
+      );
+      return;
+    }
+    const file = path.join(dataDir, "runs", runId, "run.json");
+    const record = JSON.parse(fs.readFileSync(file, "utf-8")) as RunRecord;
+    await saveCase(dataDir, caseFromRunRecord(record, task));
+  } catch (error) {
+    console.warn(
+      `[pi-loop] 案例档案入档失败（跳过——不阻塞主流程，结论已留档 run.json）：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 /** 三步链的公共产物：两条路径（stub / 真实调度）共享的配置快照与 run 骨架 */
@@ -312,6 +386,9 @@ export async function runLoopTask(
 ): Promise<LoopToolResult> {
   if (isStubMode()) return runLoopTaskStub(params);
   const prep = prepareRun(params);
+  // M5-T3 检索连线：“下一次 run 时”的头部动作——方法库/案例档案的相似条目作为
+  // designer 参考段注入素材（空库零成本缺省；检索失败降级为无注入——库是增益不是前置）
+  const retrieved = await retrieveForRun(prep.dataDir, params.task);
   const rpc = new SubagentsRpcClient(opts.busEnv ?? DEAD_BUS, {
     defaultTimeoutMs: opts.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS,
   });
@@ -329,6 +406,8 @@ export async function runLoopTask(
       signal: opts.signal,
       onUpdate: opts.onUpdate,
       verifyCommand: params.verifyCommand,
+      // M5-T3：检索结果透传给 designer（首轮与重设计均复用同一份——run 内任务与库不变）
+      retrieved,
       adapter: {
         onPlanDesigned: (designed) => {
           planSummary = {
@@ -344,6 +423,13 @@ export async function runLoopTask(
         },
       },
     });
+    // M5-T3 入档接线：run 三终点（verified / budget_exhausted / failed）统一在此收口——
+    // runWithIterations 正常返回即 finalize 已落盘（终态 run.json 可投影）。执行链异常
+    // （下方 catch）非三终点形态，不入档不噪声。PI_LOOP_NO_ARCHIVE=1 跳过入档（检索照常
+    // ——读写两开关独立）
+    if (!isArchiveDisabled()) {
+      await archiveRunCase(prep.dataDir, prep.record.id, params.task);
+    }
     const result = buildIteratedResult(prep, iteration, Date.now() - startedMs);
     // 无 entry 落痕的中止（层间检查点）在 run 级已记 error="aborted"，结果侧同步
     // 补上（iterate 的 abort 收尾已带 error="aborted"——此处为防御性双保险，不产生分歧）
