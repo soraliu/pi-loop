@@ -297,11 +297,21 @@ skip_on_model_down() {
   return 1
 }
 
+# 场景选择：E2E_SCENARIOS（默认 "A B C" 全跑；空格分隔子集如 "C" / "B C"）。
+# 动机：场景间链路异构（A/B 依赖 critic 的 LLM 评估，C 为 verifyCommand 机器断言），
+# 单一场景的环境受限不应殃及异构链路——用它在降级窗口单验仍可行的场景。
+E2E_SCENARIOS=${E2E_SCENARIOS:-"A B C"}
+scenario_enabled() {
+  case " $E2E_SCENARIOS " in *" $1 "*) return 0;; *) return 1;; esac
+}
+
 # ---------- 场景 A：designer 多步全链（默认预算 low：maxPlanSteps=3 / 并行 2） ----------
 # 任务为中等复杂度（对比研究 + 结论）；提示词明示"如需要可分解多步"——researcher
 # 兼任 designer，实际可能给出 1 步（合理判定）到 3 步，断言容忍 1 步
 PROMPT_A="调用 loop_task 工具：研究任务'pi-loop 与直接使用 pi + subagents 的差别'（中等复杂度：对比两者的工作流、适用场景与开销，如需要可分解多步执行后综合），effort: low"
 
+# 场景 A 本体：异构链路独立成段，便于选择性执行
+if scenario_enabled "A"; then
 run_scenario "A" "$DATA_A" "$OUT_A" "$TIMEOUT_S" "$PROMPT_A"
 assert_extension_loaded "$OUT_A"
 
@@ -473,12 +483,12 @@ else
   tail -50 "$OUT_A"
   exit 1
 fi
+fi  # scenario_enabled "A" —— A 段独立闭合，后续场景异构链路独立判定
 
-# 环境级 SKIP（模型层/缺席/超时/降级）连带跳过场景 B 与 C：同一环境，同因
+# 环境级 SKIP：A 的环境受限只记录 A 的结果，不再殃及 B/C（链路异构：A/B 依赖
+# critic 评估，C 为 verifyCommand 机器断言——降级窗口内 C 仍可能可行）
 if [ "$A_RESULT" = "SKIP-ENV" ]; then
-  echo "== e2e: 场景 A 环境受限 SKIP——场景 B/C 同因跳过（同一环境）"
-  echo "== e2e 汇总：A SKIP（环境）/ B SKIP（同因）/ C SKIP（同因）"
-  exit 0
+  echo "== e2e: 场景 A 环境受限 SKIP（独立记录；B/C 按各自链路独立执行）"
 fi
 
 # ---------- 场景 B：maxPlanSteps=1 强制注入（预算压缩路径） ----------
@@ -491,6 +501,8 @@ echo "== e2e[B]: 注入 settings.json（effortPresets.low.maxPlanSteps=1）强�
 
 PROMPT_B="调用 loop_task 工具：研究任务'用一句话说明 pi-loop 是什么'，effort: low"
 
+# 场景 B 本体：独立门控
+if scenario_enabled "B"; then
 run_scenario "B" "$DATA_B" "$OUT_B" "$TIMEOUT_S" "$PROMPT_B"
 assert_extension_loaded "$OUT_B"
 
@@ -556,6 +568,7 @@ else
     exit 1
   fi
 fi
+fi  # scenario_enabled "B"
 
 # ---------- 场景 C：verifyCommand 机器断言端到端（M4-T4） ----------
 # prompt 明示把下述命令字符串原样作 verifyCommand 入参（工具 schema 原生字段）。
@@ -568,6 +581,8 @@ fi
 # 代理产出波动（任务语义层面的 verifyCommand 优先级/计数计分等已由单测锁定）。
 PROMPT_C="调用 loop_task 工具：研究任务'用一句话说明 verifyCommand 机器断言的作用'，effort: low；同时传入 verifyCommand 参数，其值必须原样使用下面这条命令字符串（不要改写、不要转述）：node -e 'require(\"fs\").readdirSync(\"runs\").length>0?process.exit(0):process.exit(1)'"
 
+# 场景 C 本体：独立门控
+if scenario_enabled "C"; then
 run_scenario "C" "$DATA_C" "$OUT_C" "$TIMEOUT_S" "$PROMPT_C"
 assert_extension_loaded "$OUT_C"
 
@@ -628,6 +643,7 @@ else
   tail -50 "$OUT_C"
   exit 1
 fi
+fi  # scenario_enabled "C"
 
-echo "== e2e 汇总：A ${A_RESULT} / B ${B_RESULT} / C ${C_RESULT}"
+echo "== e2e 汇总：A ${A_RESULT} / B ${B_RESULT:--} / C ${C_RESULT}"
 exit 0
