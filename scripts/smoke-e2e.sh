@@ -301,6 +301,8 @@ skip_on_model_down() {
 # 动机：场景间链路异构（A/B 依赖 critic 的 LLM 评估，C 为 verifyCommand 机器断言），
 # 单一场景的环境受限不应殃及异构链路——用它在降级窗口单验仍可行的场景。
 E2E_SCENARIOS=${E2E_SCENARIOS:-"A B C"}
+# 场景结果预初始化（子集模式下被跳过的场景保持 "-"，末尾汇总与环境检查引用不炸 unbound）
+A_RESULT="-"; B_RESULT="-"; C_RESULT="-"
 scenario_enabled() {
   case " $E2E_SCENARIOS " in *" $1 "*) return 0;; *) return 1;; esac
 }
