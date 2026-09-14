@@ -123,12 +123,18 @@ find_run_json() {
   find "$1/runs" -name run.json -print 2>/dev/null | sort | tail -n 1
 }
 
-# run.json 的 record 级状态（node 解析；损坏/缺文件回空串）
+# run.json 的 record 级状态（node 解析；损坏/缺文件回空串）。
+# 终点语义（M4）：真终态 completed 必有 final 落盘（verified 收尾三件套）；
+# executePlan 每轮收尾写的 completed（M2 契约）在 evaluate/final 落盘前是 evaluate
+# 期间的中间态——报 "executing" 让等待循环继续（慢世界该窗口可拉长到分钟级），
+# 防终态探测抢跑掐断评估阶段留下 "completed 无 final" 的中间形态。
 run_status() {
   node -e '
     try {
       const rec = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-      console.log(typeof rec.status === "string" ? rec.status : "");
+      let s = typeof rec.status === "string" ? rec.status : "";
+      if (s === "completed" && !rec.final) s = "executing";
+      console.log(s);
     } catch {
       console.log("");
     }
@@ -251,6 +257,12 @@ run_scenario() {
 # 全文 grep 会误报缺席
 classify_env_skip() {
   local run_json="$1" out_file="$2"
+  # 真终态完成（completed + final 在场）不参与环境降级判定——链路真实跑到了终点，
+  # 断言说了算（PASS 或 FAIL），SKIP 会掩盖真实缺陷信号。此时 $OUT 里的熔断警告类
+  # 自由文本（如 SDD 层的 cached exclusion 日志）不构成降级证据。
+  if [ "$(run_status "$run_json")" = "completed" ]; then
+    return 1
+  fi
   if grep -qE "$MODEL_DOWN_RE" "$run_json" "$out_file" 2>/dev/null; then
     echo "SKIP: 模型层不可用（熔断/额度/供应商不稳）"
     tail -5 "$out_file"
