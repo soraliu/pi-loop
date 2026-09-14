@@ -59,7 +59,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 单场景总控超时（秒）：pi 调用 + 完成等待合计上限。真实链路一轮 spawn 约 1-5 分钟
 # （含 pi 侧模型调用）；designer 与每步各占一轮，600s 需紧则 SIGTERM；调度内核单步
 # 完成等待同为 10 分钟，总控先到即终止单场景。
-TIMEOUT_S=600
+TIMEOUT_S=${E2E_TIMEOUT_S:-600}
 
 # pi-subagents 缺席标记（与 src/core/orchestrator.ts / src/extension/loop-task.ts 的
 # 失败文案同步演进：spawn 超时或应答缺席时，entry.error 与工具 error 都携带此文案）
