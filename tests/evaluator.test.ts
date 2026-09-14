@@ -7,8 +7,9 @@
 //   超时（注入缩短的 verifyTimeoutMs + 真 node -e 慢脚本）→ fail；score 按输出可解析
 //   N/M 计数比例；在场零 critic spawn（互斥的机器锁定断言）。
 //   critic 通道（脚本化 FakeRpc——契约同 designer.test.ts）：三态直通；污染键净化；
-//   幽灵 blame 过滤；一切 spawn/等待/产物故障收敛 fail——诚实遥测铁律的锁定断言 =
-//   verdict !== "verified"（拿不到证据绝不自判通过）。
+//   幽灵 blame 过滤；围栏缺席时 markdown fallback 末次提取 verdict/score（provenance
+//   前缀标注——真实事故 r-mu1bxsy5-aae820 的回归锁定）；一切 spawn/等待/产物故障收敛
+//   fail——诚实遥测铁律的锁定断言 = 拿不到证据绝不自判通过。
 // 临时 dataDir 登记制清理，绝不触碰真实 ~/.pi/loop。
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -534,6 +535,8 @@ describe("evaluateResult — critic rubric 通道（无 verifyCommand）", () =>
 	});
 
 	it("回复无围栏 → fail（铁律：拿不到证据不自判通过）", async () => {
+		// 正文既无围栏、也无 markdown fallback 可提取的 verdict/score——降级提取无果，
+		// 收敛为原「未找到围栏」fail（extractMarkdownEvaluation 的皆无匹配分支）
 		const fake = new FakeRpc().script({
 			reply: "我认为这个任务已经全部完成了，都很好。",
 		});
@@ -577,6 +580,107 @@ describe("evaluateResult — critic rubric 通道（无 verifyCommand）", () =>
 		expect(evaluation.verdict).toBe("fail");
 		expect(evaluation.score).toBe(30);
 		expect(evaluation.reasons).toEqual(["最终结论"]);
+	});
+
+	it("markdown fallback（真实事故 r-mu1bxsy5-aae820 回归）：无围栏报告末次提取 verified/95，reasons 前缀标注 fallback 源", async () => {
+		// 真实事故样本精简版：正文若干段（含无分隔符的 "score 95." 评分句）+ ## 结论
+		// 终裁——全程无 ```json 围栏。旧实现在此判 fail 并拖垮迭代闭环
+		const reply = [
+			"# 评审报告",
+			"",
+			"## 过程核验",
+			"",
+			"三个计划步骤全部执行完毕，产出文件完整可读。我逐项比对了各步的验收标准与实际产物，主要证据链成立。",
+			"",
+			"对比表覆盖了至少三个一手来源；结论段的推断均有数据支撑，未发现虚报。",
+			"",
+			"Verdict: verified, score 95.",
+			"",
+			"## 结论",
+			"",
+			"verdict = verified。三步验收标准全部达成，终评通过。",
+		].join("\n");
+		const fake = new FakeRpc().script({ reply });
+		const evaluation = await evaluateResult(baseInput(), { rpc: fake });
+
+		expect(evaluation.verdict).toBe("verified");
+		expect(evaluation.score).toBe(95);
+		expect(evaluation.blame).toEqual([]);
+		// provenance 不得静默（SPEC §7.4）：唯一 reason 前缀标注 markdown fallback 通道
+		expect(evaluation.reasons).toHaveLength(1);
+		expect(evaluation.reasons[0]).toContain(
+			"[markdown fallback 通道提取：critic 未按 JSON 围栏契约输出]",
+		);
+		expect(evaluation.reasons[0]).toContain("verdict=verified");
+		expect(evaluation.reasons[0]).toContain("score=95");
+	});
+
+	it("markdown fallback 末位启发：正文先行的 verdict: fail 被结论节 Verdict: partial 覆盖（终裁在文末）", async () => {
+		const reply = [
+			"初步核对时部分证据缺失，verdict: fail 的印象一度成立。",
+			"",
+			"## 结论",
+			"",
+			"复核确认缺失证据已在补录中找到，Verdict: partial——多数验收通过但仍有一处缺口。",
+			"",
+			"Score: 60",
+		].join("\n");
+		const fake = new FakeRpc().script({ reply });
+		const evaluation = await evaluateResult(baseInput(), { rpc: fake });
+
+		// 取末次匹配：正文的 fail 是过程旁白，结论节的 partial 才是终裁（取首次会误得 fail）
+		expect(evaluation.verdict).toBe("partial");
+		expect(evaluation.score).toBe(60);
+		expect(evaluation.blame).toEqual([]);
+		expect(evaluation.reasons[0]).toContain("markdown fallback");
+		expect(evaluation.reasons[0]).toContain("verdict=partial");
+		expect(evaluation.reasons[0]).toContain("score=60");
+	});
+
+	it("markdown fallback 只提取到 verdict 无 score → score 按诚实口径 0（reasons 注明未提取）", async () => {
+		const fake = new FakeRpc().script({
+			reply: "## 结论\n\nVerdict: fail——关键验收未达成，建议返工。",
+		});
+		const evaluation = await evaluateResult(baseInput(), { rpc: fake });
+
+		expect(evaluation.verdict).toBe("fail");
+		expect(evaluation.score).toBe(0);
+		expect(evaluation.blame).toEqual([]);
+		// verdict=fail 是 critic 结论的降级提取（非 evaluator 自身故障）——provenance 可区分
+		expect(evaluation.reasons).toHaveLength(1);
+		expect(evaluation.reasons[0]).toContain("markdown fallback");
+		expect(evaluation.reasons[0]).toContain("verdict=fail");
+		expect(evaluation.reasons[0]).toContain("score 未提取（按 0 计）");
+	});
+
+	it("markdown fallback 只有 score 无 verdict → fail 收尾（三态终裁是硬要求），reasons 如实注明", async () => {
+		const fake = new FakeRpc().script({
+			reply: "整体看材料齐全完整，各步产出可读。Score: 80 的印象来自抽查，但未给出终裁。",
+		});
+		const evaluation = await evaluateResult(baseInput(), { rpc: fake });
+
+		expect(evaluation.verdict).toBe("fail");
+		expect(evaluation.score).toBe(0);
+		expect(evaluation.blame).toEqual([]);
+		const joined = joinedReasons(evaluation);
+		expect(joined).toContain("markdown fallback");
+		expect(joined).toContain("score=80");
+		expect(joined).toContain("未提取到 verdict");
+	});
+
+	it("markdown fallback 两模式皆无匹配 → 维持原「未找到围栏」fail 文案与语义（back-compat 锁定）", async () => {
+		const fake = new FakeRpc().script({
+			reply: "我看完整个执行过程了。一切顺利，任务已经完成，不需要改动。",
+		});
+		const evaluation = await evaluateResult(baseInput(), { rpc: fake });
+
+		// 围栏缺席且 verdict/score 均无可提取 → 收敛为既有 failEvaluation（逐字锁定）
+		expect(evaluation).toEqual({
+			verdict: "fail",
+			score: 0,
+			reasons: ["critic 回复中未找到 ```json 围栏（无法提取评审结论）"],
+			blame: [],
+		});
 	});
 
 	it("critic spawn 失败 → fail + 原因如实；绝不自判通过（铁律断言）", async () => {
