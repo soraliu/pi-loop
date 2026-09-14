@@ -9,11 +9,17 @@
 //      exit ≠ 0 → fail + stderr 尾部（≤500 字）入 reasons。blame 恒为空数组——
 //      退出码断言没有轮次归因概念（错误细节在 reasons 的 stderr）。
 //   ② critic rubric：无 verifyCommand 时 spawn researcher（兼任 critic；fresh 上下文、
-//      不指定 model——继承会话默认）评审任务原文与各步执行记录 → 恰好一个 ```json 围栏
-//      {verdict, score, reasons[], blame[]} → deepSanitize 净化（defend-json.ts 共享
-//      真源的原型污染键剔除）→ 形状校验（verdict 枚举/score 范围/字符串数组/stepId 过滤）。
-//      产物通道为围栏单一通道（对照 designer.ts 的"文件先/围栏后"双通道——Evaluation
-//      是小结构化对象、无落盘产物契约；选型论证见任务报告 task-1-report.md）。
+//      不指定 model——继承会话默认）评审任务原文与各步执行记录 → 产物提取双层（Evaluation
+//      是小结构化对象、无落盘产物契约——对照 designer.ts 不设文件通道；选型论证见
+//      任务报告 task-1-report.md）：
+//      围栏主通道——恰好一个 ```json 围栏 {verdict, score, reasons[], blame[]} →
+//      deepSanitize 净化（defend-json.ts 共享真源的原型污染键剔除）→ 形状校验
+//      （verdict 枚举/score 范围/字符串数组/stepId 过滤）；
+//      markdown fallback——围栏缺席时按模式末次提取自然语言 verdict/score（事故实证
+//      r-mu1bxsy5-aae820：critic 偶发不遵循围栏契约输出自然语言报告而结论本身有效，
+//      「无围栏即 fail」会把真实 verified 误判失败并拖垮迭代闭环），组装产物同走形状
+//      校验；reasons 前缀标注 fallback 来源（provenance 不得静默，SPEC §7.4）、blame
+//      恒空（markdown 无法结构化提取）；两模式皆无匹配 → 维持原「未找到围栏」fail。
 //
 // 诚实遥测铁律（SPEC §7.4）：evaluator 自身的任何故障（命令语法错/超时/命令不存在/
 // spawn 失败/等待超时/产物坏/中止）一律收敛为 verdict=fail + score 0 + blame [] +
@@ -401,6 +407,99 @@ function checkEvaluationShape(
 	};
 }
 
+/* ------------------------------------------------------------------
+ * markdown fallback（critic 回复无 ```json 围栏时的降级提取层）
+ * 事故实证（loop run r-mu1bxsy5-aae820）：researcher 兼任 critic 在 fresh 上下文
+ * 偶发不遵循围栏契约、输出自然语言评审报告，而结论本身有效——「无围栏即 fail」会把
+ * 真实 verified 判成失败并经迭代闭环反复注入 fail 直至耗尽预算。降级不降诚实遥测。
+ * ------------------------------------------------------------------ */
+
+/** markdown fallback 的 verdict 模式（大小写不敏感，取末次匹配。分隔符 [=:：] 必填——裸连的 "verdict verified" 英文句子不构成终裁依据；中西文引号均容忍） */
+const MARKDOWN_VERDICT_RE =
+	/\bverdict\s*[=:：]\s*["'“”‘’]?(verified|partial|fail)["'“”‘’]?/gi;
+
+/**
+ * markdown fallback 的 score 模式（大小写不敏感，取末次匹配）。分隔符可选是已定夺的
+ * 选型：真实事故样本（r-mu1bxsy5-aae820）即无分隔符的 "score 95."——分隔符必填会把
+ * 事故里的真实分数漏成 0、修复不覆盖事故本身。误取风险由三层既有设计兜底：
+ *   ① verdict 模式分隔符必填——无终裁 verdict 时根本不消费 score（见函数内首分支）
+ *   ② 末位启发——结论节的真 score 覆盖早先正文里的旁观数字
+ *   ③ checkEvaluationShape 的形状校验与 clamp 不变——任何误取值仍被压回 0-100 整数
+ * \b 前置守卫防 "underscore: 50" 这类词内嵌误配。
+ */
+const MARKDOWN_SCORE_RE = /\bscore\s*[=:：]?\s*(\d+)/gi;
+
+/** fallback 通道来源的前缀标注（SPEC §7.4 诚实遥测：降级提取不得静默） */
+const MARKDOWN_FALLBACK_PREFIX =
+	"[markdown fallback 通道提取：critic 未按 JSON 围栏契约输出]";
+
+/**
+ * 取模式的末次匹配（末位启发同 lastJsonFence：先期出现的 verdict/score 大概率是
+ * 过程旁白，终裁在文末）。re 须带 g 标志——matchAll 的硬要求（两常量均 gi）。
+ */
+function lastRegexMatch(
+	re: RegExp,
+	text: string,
+): RegExpExecArray | undefined {
+	let last: RegExpExecArray | undefined;
+	for (const match of text.matchAll(re)) last = match;
+	return last;
+}
+
+/**
+ * markdown fallback 提取（无 ```json 围栏时）：verdict/score 各取末次匹配 → 组装
+ * {verdict, score, reasons:[provenance 前缀 + 提取上下文], blame:[]} 复用
+ * checkEvaluationShape（枚举/范围校验与 clamp 单一真源，不复制逻辑）。诚实边界：
+ *   - 两模式皆无匹配 → 维持原「未找到围栏」fail 文案与语义（back-compat 零变化）
+ *   - 只提取到 score → 仍 fail（三态终裁缺失，降级无从成立），reasons 如实注明
+ *   - score 缺失按 0 计（宁可无分不虚报）；blame 无法结构化提取 → 恒空（不猜归因）
+ */
+function extractMarkdownEvaluation(
+	replyText: string,
+	knownStepIds: ReadonlySet<string>,
+): Evaluation {
+	const verdictMatch = lastRegexMatch(MARKDOWN_VERDICT_RE, replyText);
+	const scoreMatch = lastRegexMatch(MARKDOWN_SCORE_RE, replyText);
+	if (verdictMatch === undefined) {
+		if (scoreMatch === undefined) {
+			return failEvaluation(
+				"critic 回复中未找到 ```json 围栏（无法提取评审结论）",
+			);
+		}
+		return failEvaluation(
+			`critic 回复中未找到 \`\`\`json 围栏，markdown fallback 仅提取到 score=${scoreMatch[1]}、未提取到 verdict（无法提取评审结论）`,
+		);
+	}
+	// verdict 命中即构成降级评审；blame 无法从自然语言结构化提取——宁可空归因，不猜归因
+	const verdict = verdictMatch[1].toLowerCase();
+	const scoreNote =
+		scoreMatch === undefined
+			? "score 未提取（按 0 计）"
+			: `score=${scoreMatch[1]}`;
+	const reason = [
+		MARKDOWN_FALLBACK_PREFIX,
+		`verdict=${verdict}，${scoreNote}`,
+		"（取自自然语言末次匹配；blame 无法自 markdown 结构化提取——按空数组）",
+	].join(" ");
+	// 与主通道同一漏斗（deepSanitize → 形状校验）：本地组装理论恒过校验，但保留
+	// 防线使 fallback 产物无法绕过主通道的形状约束（verdict 枚举/score clamp）
+	const shaped = checkEvaluationShape(
+		deepSanitize({
+			verdict,
+			score: scoreMatch === undefined ? 0 : Number(scoreMatch[1]),
+			reasons: [reason],
+			blame: [],
+		}),
+		knownStepIds,
+	);
+	if (!shaped.ok) {
+		return failEvaluation(
+			`critic markdown fallback 结论形状非法：${shaped.errors.join("；")}`,
+		);
+	}
+	return shaped.evaluation;
+}
+
 /**
  * critic 的 rubric 提示词（fresh 上下文无记忆——每次评审都自带完整契约）。
  * 素材：任务原文 + 每步 {agent, 状态, 失败原因, 验收标准, 产出引用}——产出引用只给
@@ -577,9 +676,10 @@ async function runVerifyCommand(
 
 /**
  * critic rubric 通道（无 verifyCommand 时）：spawn researcher（兼任 critic，fresh、
- * 不指定 model）→ 完成等待（10 分钟口径，consts.ts 单一真源）+ abort 竞速 → 围栏
- * 单一通道提取 → deepSanitize 净化 + 形状校验。任何环节故障 → fail + reasons
- * 如实（诚实遥测铁律）。
+ * 不指定 model）→ 完成等待（10 分钟口径，consts.ts 单一真源）+ abort 竞速 → 产物
+ * 提取双层（围栏主通道；围栏缺席时 markdown fallback——extractMarkdownEvaluation）
+ * → deepSanitize 净化 + 形状校验。任何环节故障 → fail + reasons 如实（诚实遥测
+ * 铁律）。
  */
 async function runCritic(
 	input: EvaluateInput,
@@ -639,7 +739,9 @@ async function runCritic(
 				`critic 执行失败（完成事件报告 subagent 失败）：${failure}`,
 			);
 		}
-		// ③ 围栏单一通道提取（Evaluation 是小结构化对象——无文件通道；选型见任务报告）
+		// ③ 产物提取双层（Evaluation 是小结构化对象——无文件通道；选型见任务报告）：
+		//    围栏主通道优先生效；围栏缺席时 markdown fallback（extractMarkdownEvaluation
+		//    ——两模式皆无匹配时由 fallback 维持原「未找到围栏」fail 文案）
 		const replyText = collectReplyTexts(completion);
 		if (replyText.length === 0) {
 			return failEvaluation(
@@ -648,9 +750,7 @@ async function runCritic(
 		}
 		const fenced = lastJsonFence(replyText);
 		if (fenced === undefined) {
-			return failEvaluation(
-				"critic 回复中未找到 ```json 围栏（无法提取评审结论）",
-			);
+			return extractMarkdownEvaluation(replyText, knownStepIds);
 		}
 		// ④ JSON.parse → deepSanitize（原型污染键剔除——defend-json 共享真源）→ 形状校验
 		let parsed: unknown;
