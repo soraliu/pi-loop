@@ -70,6 +70,14 @@ export interface ExecutePlanContext {
 		maxParallelSubagents: number;
 	};
 	onUpdate?: (update: PlanUpdate) => void;
+	/**
+	 * 迟到完成对账读取器（B-1 修复，可注入）：完成等待超时时凭 pi-subagents 的
+	 * result 文件（通知投递前的持久形态，与事件 payload 同源）收割真实终态，
+	 * 避免事件链路被宿主长工具调用卡死时把实际完成的步骤误判为「无产物」。
+	 * 生产注入见 loop-task（createLateCompletionReader）；测试/缺省 undefined =
+	 * 不对账（M2 语义零变化）。返回值交给 readCompletion 的宽容判定消费。
+	 */
+	readLateCompletion?: (runId: string) => unknown | undefined;
 	signal?: AbortSignal;
 }
 
@@ -410,9 +418,11 @@ export async function executePlan(
 			);
 		}
 
-		// ④ 受理即视为该步 running（startedAt 落盘 + onUpdate）
+		// ④ 受理即视为该步 running（startedAt + 受理 runId 落盘 + onUpdate；runId 是
+		// 事后对账（超时分支的迟到收割）与审计主钥——事件链路断时凭它找回真实终态）
 		entry.status = "running";
 		entry.startedAt = new Date().toISOString();
+		if (runId !== undefined) entry.runId = runId;
 		saveRecord();
 		emitUpdate(step, "running");
 
@@ -444,6 +454,40 @@ export async function executePlan(
 			return failEntry(entry, step, "aborted");
 		}
 		if (completion === null || completion === undefined) {
+			// B-1 修复（实证：run r-mu1bxsy5-aae820 与 r-mu1fdvo5-37fe3d，2026-09-14）：
+			// async-complete 事件是「观察通道而非交付回执」——宿主会话被长工具调用
+			// 占用时通知插不进、事件永不 emit，而 subagent 实际已 state=complete、
+			// result 文件因「投递成功后删除」的生命周期恰恰持留在盘。判死前先对账
+			// （pi-subagents 文档背书口径：read run state from the status files
+			// rather than from event traffic），有凭据则按迟到终态收敛；无凭据才是
+			// 真超时——stop() 切断在途（判死后化身像尸裸奔的第三种死法，同日实证）
+			// 再判死。
+			const latePayload =
+				runId !== undefined && ctx.readLateCompletion !== undefined
+					? ctx.readLateCompletion(runId)
+					: undefined;
+			if (latePayload !== null && latePayload !== undefined) {
+				entry.lateCompletion = true;
+				const reading = readCompletion(latePayload);
+				if (reading.failed) {
+					return failEntry(
+						entry,
+						step,
+						reading.error ?? "subagent 执行失败（迟到对账）",
+						reading.summary,
+					);
+				}
+				entry.status = "succeeded";
+				entry.endedAt = new Date().toISOString();
+				if (reading.outputRef !== undefined)
+					entry.outputRef = reading.outputRef;
+				saveRecord();
+				emitUpdate(step, "succeeded", reading.summary);
+				return true;
+			}
+			if (runId !== undefined) {
+				await ctx.rpc.stop(runId, STOP_TIMEOUT_MS).catch(() => undefined);
+			}
 			return failEntry(
 				entry,
 				step,

@@ -22,6 +22,7 @@ import {
   type IterationResult,
   type RoundEvent,
 } from "../core/iterate.ts";
+import { createLateCompletionReader } from "../core/reconcile.ts";
 import type { PlanUpdate } from "../core/orchestrator.ts";
 import type { DesignerOutcome } from "../core/designer.ts";
 import { retrieve, type RetrievalResult } from "../core/retrieval.ts";
@@ -406,6 +407,9 @@ export async function runLoopTask(
       signal: opts.signal,
       onUpdate: opts.onUpdate,
       verifyCommand: params.verifyCommand,
+      // B-1 修复（r-mu1bxsy5/r-mu1fdvo5 实证，2026-09-14）：超时判死前从 pi-subagents 的
+      // result 文件收割迟到终态——事件链路被宿主长工具调用卡死时避免误判「无产物」
+      readLateCompletion: createLateCompletionReader(),
       // M5-T3：检索结果透传给 designer（首轮与重设计均复用同一份——run 内任务与库不变）
       retrieved,
       adapter: {
