@@ -100,6 +100,11 @@ export interface IterateContext {
 	/** 机器验收命令（在场即唯一权威——零 critic spawn；blame 恒空导致重跑为原样重跑） */
 	verifyCommand?: string;
 	/**
+	 * 迟到完成对账读取器（B-1 修复，透传给 executePlan 的注入面——见该接口注释；
+	 * 缺省 undefined = 既有语义零变化，仅超时判死 + stop 切断注入后的新行为）
+	 */
+	readLateCompletion?: (runId: string) => unknown | undefined;
+	/**
 	 * 相似检索结果（M5-T3 检索连线）：扩展层在 prepareRun 后经 listMethods+listCases+
 	 * retrieve 算好传入（"下一次 run 时"的贯通线——上一 run 的入档发生在它的收尾，本轮的
 	 * 检索发生在头部，自引用不可能）。首轮与重设计的 generatePlan 均透传同一份（run
@@ -405,6 +410,7 @@ export async function runWithIterations(
 			runId: ctx.runId,
 			dataDir: ctx.dataDir,
 			onUpdate: ctx.onUpdate,
+			readLateCompletion: ctx.readLateCompletion,
 			signal: ctx.signal,
 			budget: {
 				maxPlanSteps: preset.maxPlanSteps,

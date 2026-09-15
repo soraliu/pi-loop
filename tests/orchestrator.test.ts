@@ -70,6 +70,9 @@ function readRecord(
 		startedAt?: string;
 		endedAt?: string;
 		error?: string;
+		/** B-1 修复：对账主键与迟到收割痕 */
+		runId?: string;
+		lateCompletion?: boolean;
 	}>;
 } {
 	return JSON.parse(
@@ -347,6 +350,110 @@ describe("executePlan — 失败路径", () => {
 		for (const entry of final.iterations) {
 			expect(entry.error).toContain("等待完成超时");
 		}
+		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
+	});
+
+	it("超时无对账凭据（无注入）→ stop 切断在途后照样判死（M2 兼容 + 第三种死法收口）", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		fake.timeoutCompletions = true;
+		const outcome = await executePlan(fanPlan(), { rpc: fake, runId, dataDir });
+
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		// stop 在判死前被调用（每超时步一次）——切断「判死后化身像尸裸奔」的第三种死法
+		expect(fake.stopCalls).toEqual(["run-1", "run-2"]);
+		// 受理 runId 落盘（对账/审计主键）
+		expect(final.iterations.map((e) => e.runId)).toEqual(["run-1", "run-2"]);
+		expect(final.iterations.every((e) => e.lateCompletion === undefined)).toBe(
+			true,
+		);
+		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
+	});
+
+	it("超时但对账收回真实完成（result 文件在场）→ 迟到收割 succeeded + lateCompletion 痕 + 下游继续", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		fake.timeoutCompletions = true;
+		// 事件链路死（超时），但 pi-subagents 的 result 文件形态在场（与事件 payload 同源）
+		const lateResults = new Map<string, unknown>([
+			[
+				"run-1",
+				{
+					id: "run-1",
+					success: true,
+					state: "complete",
+					exitCode: 0,
+					results: [{ outputReference: "/tmp/late/worker-b.md" }],
+				},
+			],
+			[
+				"run-2",
+				{
+					id: "run-2",
+					success: true,
+					state: "complete",
+					exitCode: 0,
+					results: [{ outputReference: "/tmp/late/worker-c.md" }],
+			},
+			],
+			[
+				"run-3",
+				{
+					id: "run-3",
+					success: true,
+					state: "complete",
+					exitCode: 0,
+					results: [{ outputReference: "/tmp/late/worker-a.md" }],
+				},
+			],
+		]);
+		const outcome = await executePlan(fanPlan(), {
+			rpc: fake,
+			runId,
+			dataDir,
+			readLateCompletion: (lateRunId) => lateResults.get(lateRunId),
+		});
+
+		const final = readRecord(dataDir, runId);
+		// 两超时步均迟到收割：不再判死 6 全灭，计划继续开下游 a（a 的完成走常规事件）
+		expect(final.status).toBe("completed");
+		expect(final.iterations.map((e) => e.stepId)).toEqual(["b", "c", "a"]);
+		for (const entry of final.iterations) {
+			expect(entry.status).toBe("succeeded");
+			expect(entry.lateCompletion).toBe(true);
+		}
+		expect(final.iterations[0].outputRef).toBe("/tmp/late/worker-b.md");
+		expect(final.iterations[1].outputRef).toBe("/tmp/late/worker-c.md");
+		expect(final.iterations[2].outputRef).toBe("/tmp/late/worker-a.md");
+		// 迟到收割不调 stop（凭据在手，run 已终结态）
+		expect(fake.stopCalls).toEqual([]);
+		expect(outcome).toMatchObject({ steps: 3, succeeded: 3, failed: 0 });
+	});
+
+	it("超时但对账收回失败形态（result 报告 success:false）→ 判死用真实错误而非「超时」误报", async () => {
+		const { dataDir, runId } = setupRun();
+		const fake = new FakeRpc();
+		fake.timeoutCompletions = true;
+		const outcome = await executePlan(fanPlan(), {
+			rpc: fake,
+			runId,
+			dataDir,
+			readLateCompletion: () => ({
+				id: "run-1",
+				success: false,
+				state: "failed",
+				error: "boom: agent 执行中报错",
+			}),
+		});
+
+		const final = readRecord(dataDir, runId);
+		expect(final.status).toBe("failed");
+		const late = final.iterations.find((e) => e.runId === "run-1");
+		expect(late?.status).toBe("failed");
+		expect(late?.error).toContain("boom");
+		expect(late?.error).not.toContain("等待完成超时");
+		expect(late?.lateCompletion).toBe(true);
 		expect(outcome).toMatchObject({ steps: 3, succeeded: 0, failed: 2 });
 	});
 

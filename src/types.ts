@@ -209,6 +209,12 @@ export interface IterationEntry {
 	error?: string;
 	/** 所属迭代轮（M4-T2：0 起计——0=首轮；多轮执行的 entry 分轮归组，读取侧按 round 分组展示。orchestrator 落盘时不感知轮次，由迭代引擎补标） */
 	round?: number;
+	/** pi-subagents 受理 runId（事后对账与审计主键：完成事件丢失时凭它读 run 终态,
+	 * 见 runStep 超时分支的迟到收割——runId 可能为协议缺省形（单步计划时允许）） */
+	runId?: string;
+	/** 迟到收割标记（完成等待超时后经 pi-subagents result 文件对账得到的终态,
+	 * 而非 async-complete 事件——诚实遥测：该步真实终态与事件链路无关地成立） */
+	lateCompletion?: boolean;
 }
 
 /* ================================================================
